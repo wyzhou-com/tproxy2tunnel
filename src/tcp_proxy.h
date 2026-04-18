@@ -9,7 +9,7 @@
 #include "fakedns.h"
 
 #define TCP_SPLICE_MAXLEN         (64 * 1024) /* PIPE_DEF_BUFSZ on x86-64 (16 * PAGE_SIZE) */
-#define TCP_CONNECT_TIMEOUT_SEC   15.0        /* ev_tstamp: connect + header send deadline */
+#define TCP_CONNECT_TIMEOUT_SEC   5.0         /* ev_tstamp: connect + header send deadline */
 
 /* addr_hdr_domain_t(2) + domain(FAKEDNS_MAX_DOMAIN_LEN-1) + portno_t(2) */
 #define TCP_ADDR_HDR_MAXLEN \

@@ -203,45 +203,43 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, struct ev_watcher *watcher, int reve
     memcpy(context->hs.addr_hdr, addr_hdr_buf, addr_hdr_len);
     context->hs.addr_hdr_len = (uint16_t)addr_hdr_len;
 
-    /* Set up remote watcher callback based on TFO state */
+    /* All TFO states funnel through tcp_tunnel_connect_cb, which is the single
+     * point that confirms SYN-ACK via tcp_has_error() before dispatching to the
+     * next stage (forwarding or header-send) based on send_offset. */
     io_watcher = &context->remote_watcher;
-    bool tfo_complete = false;
-
-    if (tfo_nsend >= 0 && (size_t)tfo_nsend >= tfo_datalen) {
-        /* TFO sent full header — will start forwarding immediately */
-        ev_io_init(io_watcher, tcp_stream_payload_forward_cb, remote_sockfd, EV_READ);
-        tfo_complete = true;
-        tfo_nsend = 0;
-    } else {
-        ev_io_init(io_watcher, tfo_nsend >= 0 ? tcp_tunnel_send_header_cb : tcp_tunnel_connect_cb,
-                   remote_sockfd, EV_WRITE);
-        tfo_nsend = tfo_nsend >= 0 ? tfo_nsend : 0;
-    }
-    context->hs.send_offset = (uint16_t)tfo_nsend;
+    ev_io_init(io_watcher, tcp_tunnel_connect_cb, remote_sockfd, EV_WRITE);
+    context->hs.send_offset = (uint16_t)(tfo_nsend >= 0 ? tfo_nsend : 0);
 
     context->connect_timer.data = context;
     ev_timer_init(&context->connect_timer, tcp_connect_timeout_cb, TCP_CONNECT_TIMEOUT_SEC, 0.);
 
-    if (tfo_complete) {
-        /* Header already fully sent via TFO — skip timer, go straight to forwarding */
-        if (!tcp_start_forwarding(evloop, context)) return;
-        ev_io_start(evloop, io_watcher);
-    } else {
-        ev_io_start(evloop, io_watcher);
-        ev_timer_start(evloop, &context->connect_timer);
-    }
+    ev_io_start(evloop, io_watcher);
+    ev_timer_start(evloop, &context->connect_timer);
 }
 
 /* ── Tunnel callbacks: connect → send header → forward ── */
 
 static void tcp_tunnel_connect_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     evio_t *remote_watcher = (evio_t *)watcher;
+    tcp_tunnel_ctx_t *context = get_ctx_by_watcher(remote_watcher);
     if (tcp_has_error(remote_watcher->fd)) {
         LOGERR("[tcp_tunnel_connect_cb] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
-        tcp_context_release(evloop, get_ctx_by_watcher(remote_watcher), true);
+        tcp_context_release(evloop, context, true);
         return;
     }
     LOGINF("[tcp_tunnel_connect_cb] connect to %s#%hu succeeded", g_server_ipstr, g_server_portno);
+
+    if (context->hs.send_offset >= context->hs.addr_hdr_len) {
+        /* TFO path: header was piggybacked on SYN, handshake now confirmed —
+         * skip the header-send stage and go straight to forwarding. */
+        context->hs.send_offset = 0;
+        ev_io_stop(evloop, remote_watcher);
+        ev_io_init(remote_watcher, tcp_stream_payload_forward_cb, remote_watcher->fd, EV_READ);
+        if (!tcp_start_forwarding(evloop, context)) return;
+        ev_io_start(evloop, remote_watcher);
+        return;
+    }
+
     ev_set_cb(remote_watcher, tcp_tunnel_send_header_cb);
     ev_invoke(evloop, remote_watcher, EV_WRITE);
 }
