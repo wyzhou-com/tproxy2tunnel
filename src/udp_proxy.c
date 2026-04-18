@@ -302,7 +302,7 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         context->last_active = ev_now(evloop);
 
         udp_tunnelctx_t *del_context = NULL;
-        context->fork_key = fork_key;
+        memcpy(&context->fork_key, &fork_key, sizeof(fork_key));
 
         if (force_fork) {
             context->is_forked = true;
