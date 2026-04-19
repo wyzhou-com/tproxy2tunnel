@@ -4,12 +4,23 @@
 
 #include "logutils.h"
 
-void addr_header_build(void *buf, const void *skaddr, const char *domain, size_t *out_len) {
+bool addr_header_build(void *buf, size_t buf_len, const void *skaddr, const char *domain, size_t *out_len) {
     if (domain) {
+        size_t domain_len = strlen(domain);
+        if (domain_len > MAX_DOMAIN_LEN) {
+            LOGERR("[addr_header_build] domain too long: %zu > %d", domain_len, MAX_DOMAIN_LEN);
+            return false;
+        }
+        size_t need = sizeof(addr_hdr_domain_t) + domain_len + sizeof(portno_t);
+        if (buf_len < need) {
+            LOGERR("[addr_header_build] buf too small for domain header: %zu < %zu", buf_len, need);
+            return false;
+        }
+
         addr_hdr_domain_t *hdr = buf;
         hdr->addrtype = ADDRTYPE_DOMAIN;
-        hdr->domain_len = (uint8_t)strlen(domain);
-        memcpy(hdr->domain_str, domain, hdr->domain_len);
+        hdr->domain_len = (uint8_t)domain_len;
+        memcpy(hdr->domain_str, domain, domain_len);
 
         portno_t port;
         if (((const skaddr4_t *)skaddr)->sin_family == AF_INET) {
@@ -17,12 +28,16 @@ void addr_header_build(void *buf, const void *skaddr, const char *domain, size_t
         } else {
             port = ((const skaddr6_t *)skaddr)->sin6_port;
         }
-        memcpy(hdr->domain_str + hdr->domain_len, &port, sizeof(portno_t));
+        memcpy(hdr->domain_str + domain_len, &port, sizeof(portno_t));
 
         if (out_len) {
-            *out_len = sizeof(addr_hdr_domain_t) + hdr->domain_len + sizeof(portno_t);
+            *out_len = need;
         }
     } else if (((const skaddr4_t *)skaddr)->sin_family == AF_INET) {
+        if (buf_len < sizeof(addr_hdr_ipv4_t)) {
+            LOGERR("[addr_header_build] buf too small for ipv4 header: %zu < %zu", buf_len, sizeof(addr_hdr_ipv4_t));
+            return false;
+        }
         const skaddr4_t *addr = skaddr;
         addr_hdr_ipv4_t *hdr = buf;
         hdr->addrtype = ADDRTYPE_IPV4;
@@ -32,6 +47,10 @@ void addr_header_build(void *buf, const void *skaddr, const char *domain, size_t
             *out_len = sizeof(addr_hdr_ipv4_t);
         }
     } else {
+        if (buf_len < sizeof(addr_hdr_ipv6_t)) {
+            LOGERR("[addr_header_build] buf too small for ipv6 header: %zu < %zu", buf_len, sizeof(addr_hdr_ipv6_t));
+            return false;
+        }
         const skaddr6_t *addr = skaddr;
         addr_hdr_ipv6_t *hdr = buf;
         hdr->addrtype = ADDRTYPE_IPV6;
@@ -41,6 +60,7 @@ void addr_header_build(void *buf, const void *skaddr, const char *domain, size_t
             *out_len = sizeof(addr_hdr_ipv6_t);
         }
     }
+    return true;
 }
 
 char *addr_header_build_udp(char *payload_start, const char *domain,

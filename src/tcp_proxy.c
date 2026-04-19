@@ -147,7 +147,11 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, struct ev_watcher *watcher, int reve
     /* Build address header on stack (needed before connect for TFO) */
     uint8_t addr_hdr_buf[TCP_ADDR_HDR_MAXLEN];
     size_t addr_hdr_len = 0;
-    addr_header_build(addr_hdr_buf, &skaddr, fake_domain, &addr_hdr_len);
+    if (!addr_header_build(addr_hdr_buf, sizeof(addr_hdr_buf), &skaddr, fake_domain, &addr_hdr_len)) {
+        LOGERR("[tcp_tproxy_accept_cb] failed to build tunnel address header");
+        tcp_close_by_rst(client_sockfd);
+        return;
+    }
 
     int remote_sockfd = new_tcp_connect_sockfd(g_server_skaddr.sin6_family, g_tcp_syncnt_max);
     if (remote_sockfd < 0) {

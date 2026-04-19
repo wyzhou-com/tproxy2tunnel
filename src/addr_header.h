@@ -54,12 +54,15 @@ typedef addr_hdr_domain_t udp_tunnel_hdr_domain_t;   /* 2+N+2 bytes */
 /*
  * Build a tunnel address header into `buf`.
  *
- * @param buf       Output buffer, must be at least ADDR_HDR_MAXLEN bytes.
+ * @param buf       Output buffer.
+ * @param buf_len   Capacity of buf in bytes.
  * @param skaddr    Socket address (skaddr4_t or skaddr6_t).
  * @param domain    Domain name, or NULL for IP address mode.
- * @param out_len   Output: number of bytes written to buf.
+ * @param out_len   Output: number of bytes written to buf (unchanged on failure).
+ * @return          true on success; false if domain exceeds MAX_DOMAIN_LEN or
+ *                  buf_len is insufficient for the encoded header.
  */
-void addr_header_build(void *buf, const void *skaddr, const char *domain, size_t *out_len);
+bool addr_header_build(void *buf, size_t buf_len, const void *skaddr, const char *domain, size_t *out_len);
 
 /*
  * Build a tunnel UDP header backward from payload_start.
