@@ -428,8 +428,15 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
             }
         }
 
-        /* Get or create tproxy context */
-        udp_tproxyctx_t *tproxyctx = udp_tproxyctx_find(&g_udp_tproxyctx_table, &fromipport);
+        /* Get or create tproxy context. Zero the key first so any struct
+         * padding has a deterministic value — the LRU hash is computed over
+         * sizeof(key), so padding participates in equality. */
+        udp_tproxy_key_t tproxy_key;
+        memset(&tproxy_key, 0, sizeof(tproxy_key));
+        tproxy_key.target_is_ipv4 = dest_isipv4;
+        tproxy_key.ipport = fromipport;
+
+        udp_tproxyctx_t *tproxyctx = udp_tproxyctx_find(&g_udp_tproxyctx_table, &tproxy_key);
         if (!tproxyctx) {
             skaddr6_t fromskaddr;
             skaddr_from_ip_port(&fromskaddr, &fromipport, dest_isipv4);
@@ -452,7 +459,7 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
                 close(tproxy_sockfd);
                 continue;
             }
-            tproxyctx->key_ipport = fromipport;
+            memcpy(&tproxyctx->key, &tproxy_key, sizeof(tproxy_key));
             tproxyctx->udp_sockfd = tproxy_sockfd;
             tproxyctx->last_active = ev_now(evloop);
             udp_tproxyctx_t *del_context = udp_tproxyctx_add(&g_udp_tproxyctx_table, tproxyctx);
@@ -532,7 +539,7 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
                            sent, group_count, group_count - sent);
                 }
                 log_udp_transfer("udp_tunnel_recv_cb", "sendmmsg",
-                                 &ctx->key_ipport, &tunnelctx->key_ipport,
+                                 &ctx->key.ipport, &tunnelctx->key_ipport,
                                  tunnelctx->dest_is_ipv4, "npackets", sent);
             }
 

@@ -68,11 +68,11 @@ LRU_DEFINE_FIND(udp_tunnelctx_fork_find,
  * ════════════════════════════════════════════════════════════════════════ */
 
 LRU_DEFINE_ADD(udp_tproxyctx_add,
-               udp_tproxyctx_t, key_ipport,
+               udp_tproxyctx_t, key,
                udp_lrucache_get_tproxy_maxsize(), last_active)
 
 LRU_DEFINE_FIND(udp_tproxyctx_find,
-                udp_tproxyctx_t, ip_port_t)
+                udp_tproxyctx_t, udp_tproxy_key_t)
 
 LRU_DEFINE_DEL(udp_tproxyctx_del,
                udp_tproxyctx_t)

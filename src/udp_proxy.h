@@ -54,6 +54,17 @@ typedef struct {
     ip_port_t target_ipport;    /* full address for Symmetric NAT  */
 } udp_fork_key_t;
 
+/*
+ * udp_tproxy_key_t — TProxy Table key.
+ * Disambiguates IPv4/IPv6 remote source addresses so that a v4 address
+ * whose bytes happen to match the low bytes of a v6 address cannot share
+ * a cache entry (the two bind to different sockets).
+ */
+typedef struct {
+    bool      target_is_ipv4;
+    ip_port_t ipport;
+} udp_tproxy_key_t;
+
 /* ════════════════════════════════════════════════════════════════════════
  * udp_tunnelctx_t — session context for the Main Table and Fork Table
  *
@@ -87,7 +98,7 @@ typedef struct {
  * ════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    ip_port_t key_ipport;   /* (remote) source socket address */
+    udp_tproxy_key_t key;   /* address-family + (remote) source socket address */
     int       udp_sockfd;   /* bound to the above address      */
     ev_tstamp last_active;  /* GC timestamp */
 
@@ -105,9 +116,9 @@ udp_tunnelctx_t* udp_tunnelctx_fork_add(udp_tunnelctx_t **cache, udp_tunnelctx_t
 udp_tproxyctx_t* udp_tproxyctx_add(udp_tproxyctx_t **cache, udp_tproxyctx_t *entry);
 
 /* find — pure lookup; returns NULL on miss */
-udp_tunnelctx_t* udp_tunnelctx_find(udp_tunnelctx_t **cache, const ip_port_t      *keyptr);
-udp_tunnelctx_t* udp_tunnelctx_fork_find(udp_tunnelctx_t **cache, const udp_fork_key_t *keyptr);
-udp_tproxyctx_t* udp_tproxyctx_find(udp_tproxyctx_t **cache, const ip_port_t      *keyptr);
+udp_tunnelctx_t* udp_tunnelctx_find(udp_tunnelctx_t **cache, const ip_port_t        *keyptr);
+udp_tunnelctx_t* udp_tunnelctx_fork_find(udp_tunnelctx_t **cache, const udp_fork_key_t   *keyptr);
+udp_tproxyctx_t* udp_tproxyctx_find(udp_tproxyctx_t **cache, const udp_tproxy_key_t *keyptr);
 
 /* del — unconditional removal */
 void udp_tunnelctx_del(udp_tunnelctx_t **cache, udp_tunnelctx_t *entry);
