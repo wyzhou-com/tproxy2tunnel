@@ -45,7 +45,7 @@ typedef struct sockaddr_in6 skaddr6_t;
 void set_nofile_limit(size_t nofile);
 size_t get_nofile_limit(void);
 
-void run_as_user(const char *username, char *argv[]);
+bool run_as_user(const char *username, char *argv[]);
 
 int get_ipstr_family(const char *ipstr);
 void build_socket_addr(int family, void *skaddr, const char *ipstr, portno_t portno);

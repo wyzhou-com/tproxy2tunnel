@@ -98,7 +98,13 @@ static bool validate_uint_range(const char *valstr, unsigned long max_val, unsig
     return true;
 }
 
-static void parse_command_args(int argc, char* argv[]) {
+typedef struct {
+    const char   *run_user;               /* NULL if --run-user not set */
+    unsigned long nofile_limit;
+    bool          set_nofile_limit_enabled;
+} startup_config_t;
+
+static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
     opterr = 0;
     const char *optstr = ":s:p:b:B:l:S:c:o:j:J:n:u:TU46RrwWvVh";
     const struct option options[] = {
@@ -209,11 +215,12 @@ static void parse_command_args(int argc, char* argv[]) {
                     if (!validate_uint_range(optarg, ULONG_MAX, &val, "nofile limit")) {
                         goto PRINT_HELP_AND_EXIT;
                     }
-                    set_nofile_limit(val);
+                    cfg->nofile_limit = val;
+                    cfg->set_nofile_limit_enabled = true;
                     break;
                 }
             case 'u':
-                run_as_user(optarg, argv);
+                cfg->run_user = optarg;
                 break;
             case 'T':
                 g_options &= (uint16_t)~OPT_ENABLE_UDP;
@@ -229,8 +236,6 @@ static void parse_command_args(int argc, char* argv[]) {
                 break;
             case 'R':
                 g_options |= OPT_TCP_USE_REDIRECT;
-                strcpy(g_bind_ipstr4, IP4STR_WILDCARD);
-                strcpy(g_bind_ipstr6, IP6STR_WILDCARD);
                 break;
             case 'r':
                 g_options |= OPT_ALWAYS_REUSE_PORT;
@@ -303,13 +308,6 @@ static void parse_command_args(int argc, char* argv[]) {
     if (g_udp_nthreads > g_nthreads) {
         g_udp_nthreads = g_nthreads;
     }
-
-    build_socket_addr(AF_INET, &g_bind_skaddr4, g_bind_ipstr4, g_bind_portno);
-    build_socket_addr(AF_INET6, &g_bind_skaddr6, g_bind_ipstr6, g_bind_portno);
-    build_socket_addr(get_ipstr_family(g_server_ipstr), &g_server_skaddr, g_server_ipstr, g_server_portno);
-    if (g_options & OPT_ENABLE_FAKEDNS) {
-        build_socket_addr(AF_INET, &g_fakedns_skaddr, g_fakedns_ipstr, g_fakedns_portno);
-    }
     return;
 
 PRINT_HELP_AND_EXIT:
@@ -327,14 +325,56 @@ int main(int argc, char* argv[]) {
     pthread_sigmask(SIG_BLOCK, &mask, NULL);
 
     setvbuf(stdout, NULL, _IOLBF, 256);
-    parse_command_args(argc, argv);
+
+    startup_config_t cfg = {0};
+    parse_command_args(argc, argv, &cfg);
+
+    /* 1. Apply RLIMIT_NOFILE (may need root). */
+    if (cfg.set_nofile_limit_enabled) {
+        set_nofile_limit(cfg.nofile_limit);
+    }
+
+    /* 2. Build socket addresses. UDP uses user-specified bind addr; TCP uses
+     *    wildcard in redirect mode (packets arrive rewritten to local addr)
+     *    and the same bind addr as UDP in tproxy mode. */
+    build_socket_addr(AF_INET,  &g_bind_skaddr4, g_bind_ipstr4, g_bind_portno);
+    build_socket_addr(AF_INET6, &g_bind_skaddr6, g_bind_ipstr6, g_bind_portno);
+    if (g_options & OPT_TCP_USE_REDIRECT) {
+        build_socket_addr(AF_INET,  &g_tcp_bind_skaddr4, IP4STR_WILDCARD, g_bind_portno);
+        build_socket_addr(AF_INET6, &g_tcp_bind_skaddr6, IP6STR_WILDCARD, g_bind_portno);
+    } else {
+        g_tcp_bind_skaddr4 = g_bind_skaddr4;
+        g_tcp_bind_skaddr6 = g_bind_skaddr6;
+    }
+    build_socket_addr(get_ipstr_family(g_server_ipstr), &g_server_skaddr, g_server_ipstr, g_server_portno);
+    if (g_options & OPT_ENABLE_FAKEDNS) {
+        build_socket_addr(AF_INET, &g_fakedns_skaddr, g_fakedns_ipstr, g_fakedns_portno);
+    }
+
+    /* 3. Drop privileges last (after nofile limit + address build). */
+    if (cfg.run_user) {
+        if (!run_as_user(cfg.run_user, argv)) {
+            LOGERR("[main] failed to run as user '%s', exiting", cfg.run_user);
+            return 1;
+        }
+    }
 
     LOG_ALWAYS_INF("[main] tunnel server address: %s#%hu", g_server_ipstr, g_server_portno);
     if (g_options & OPT_ENABLE_IPV4) {
-        LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr4, g_bind_portno);
+        if (g_options & OPT_TCP_USE_REDIRECT) {
+            LOG_ALWAYS_INF("[main] listen address: udp=%s#%hu tcp=%s#%hu",
+                           g_bind_ipstr4, g_bind_portno, IP4STR_WILDCARD, g_bind_portno);
+        } else {
+            LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr4, g_bind_portno);
+        }
     }
     if (g_options & OPT_ENABLE_IPV6) {
-        LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr6, g_bind_portno);
+        if (g_options & OPT_TCP_USE_REDIRECT) {
+            LOG_ALWAYS_INF("[main] listen address: udp=%s#%hu tcp=%s#%hu",
+                           g_bind_ipstr6, g_bind_portno, IP6STR_WILDCARD, g_bind_portno);
+        } else {
+            LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr6, g_bind_portno);
+        }
     }
     if (g_tcp_syncnt_max) {
         LOG_ALWAYS_INF("[main] max number of syn retries: %hhu", g_tcp_syncnt_max);
@@ -547,6 +587,13 @@ static void* run_event_loop(void *arg) {
     int my_thread_index = is_main_thread ? 0 : thread_info->thread_index;
     bool should_handle_udp = (my_thread_index < g_udp_nthreads) && (g_options & OPT_ENABLE_UDP);
 
+    /* All cleanup-state is now initialized; only here is it safe to goto cleanup. */
+    if (!evloop) {
+        LOGERR("[run_event_loop] ev_loop_new failed for main thread");
+        exit_code = 1;
+        goto cleanup;
+    }
+
     /* 1. UDP Context Pools */
     if (should_handle_udp) {
         g_udp_context_pool = mempool_create(
@@ -606,10 +653,10 @@ static void* run_event_loop(void *arg) {
     enum { EP_TCP4 = 0, EP_TCP6, EP_UDP4, EP_UDP6, EP_COUNT };
 
     listen_endpoint_t endpoints[EP_COUNT] = {
-        [EP_TCP4] = { &sockfds[0], &watchers[0], AF_INET,  true,  &g_bind_skaddr4, sizeof(skaddr4_t), tcp_tproxy_accept_cb,  "tcp4" },
-        [EP_TCP6] = { &sockfds[1], &watchers[1], AF_INET6, true,  &g_bind_skaddr6, sizeof(skaddr6_t), tcp_tproxy_accept_cb,  "tcp6" },
-        [EP_UDP4] = { &sockfds[2], &watchers[2], AF_INET,  false, &g_bind_skaddr4, sizeof(skaddr4_t), udp_tproxy_recvmsg_cb, "udp4" },
-        [EP_UDP6] = { &sockfds[3], &watchers[3], AF_INET6, false, &g_bind_skaddr6, sizeof(skaddr6_t), udp_tproxy_recvmsg_cb, "udp6" },
+        [EP_TCP4] = { &sockfds[0], &watchers[0], AF_INET,  true,  &g_tcp_bind_skaddr4, sizeof(skaddr4_t), tcp_tproxy_accept_cb,  "tcp4" },
+        [EP_TCP6] = { &sockfds[1], &watchers[1], AF_INET6, true,  &g_tcp_bind_skaddr6, sizeof(skaddr6_t), tcp_tproxy_accept_cb,  "tcp6" },
+        [EP_UDP4] = { &sockfds[2], &watchers[2], AF_INET,  false, &g_bind_skaddr4,     sizeof(skaddr4_t), udp_tproxy_recvmsg_cb, "udp4" },
+        [EP_UDP6] = { &sockfds[3], &watchers[3], AF_INET6, false, &g_bind_skaddr6,     sizeof(skaddr6_t), udp_tproxy_recvmsg_cb, "udp6" },
     };
 
     bool ep_enabled[EP_COUNT] = {
@@ -674,10 +721,10 @@ cleanup:
         ev_async_stop(evloop, &thread_info->exit_watcher);
     }
 
-    if (should_handle_udp) {
+    if (evloop && should_handle_udp) {
         udp_proxy_close_all_sessions(evloop);
     }
-    if (g_options & OPT_ENABLE_TCP) {
+    if (evloop && (g_options & OPT_ENABLE_TCP)) {
         tcp_proxy_close_all_sessions(evloop);
     }
 

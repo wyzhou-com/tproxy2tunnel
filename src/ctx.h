@@ -43,8 +43,10 @@ extern uint8_t  g_udp_nthreads;
 extern char      g_bind_ipstr4[IP4STRLEN];
 extern char      g_bind_ipstr6[IP6STRLEN];
 extern portno_t  g_bind_portno;
-extern skaddr4_t g_bind_skaddr4;
+extern skaddr4_t g_bind_skaddr4;      /* UDP listen (and TCP in tproxy mode) */
 extern skaddr6_t g_bind_skaddr6;
+extern skaddr4_t g_tcp_bind_skaddr4;  /* TCP listen; wildcard in redirect mode */
+extern skaddr6_t g_tcp_bind_skaddr6;
 
 extern char      g_server_ipstr[IP6STRLEN];
 extern portno_t  g_server_portno;

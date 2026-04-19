@@ -70,46 +70,48 @@ size_t get_nofile_limit(void) {
     return v.rlim_cur;
 }
 
-void run_as_user(const char *username, char *argv[]) {
+bool run_as_user(const char *username, char *argv[]) {
     if (geteuid() != 0) {
-        return; /* ignore if current user is not root */
+        LOGINF("[run_as_user] not running as root, ignore --run-user='%s'", username);
+        return true; /* ignore if current user is not root */
     }
 
     const struct passwd *userinfo = getpwnam(username);
     if (!userinfo) {
         LOGERR("[run_as_user] user:'%s' does not exist in this system", username);
-        return;
+        return false;
     }
 
     if (userinfo->pw_uid == 0) {
-        return; /* ignore if target user is root */
+        return true; /* ignore if target user is root */
     }
 
     if (setgid(userinfo->pw_gid) < 0) {
         LOGERR("[run_as_user] change to gid:%u of user:'%s': %s", userinfo->pw_gid, userinfo->pw_name, strerror(errno));
-        exit(errno);
+        return false;
     }
 
     if (initgroups(userinfo->pw_name, userinfo->pw_gid) < 0) {
         LOGERR("[run_as_user] initgroups(%u) of user:'%s': %s", userinfo->pw_gid, userinfo->pw_name, strerror(errno));
-        exit(errno);
+        return false;
     }
 
     if (setuid(userinfo->pw_uid) < 0) {
         LOGERR("[run_as_user] change to uid:%u of user:'%s': %s", userinfo->pw_uid, userinfo->pw_name, strerror(errno));
-        exit(errno);
+        return false;
     }
 
     static char execfile_abspath[PATH_MAX] = {0};
     if (readlink("/proc/self/exe", execfile_abspath, PATH_MAX - 1) < 0) {
         LOGERR("[run_as_user] readlink('/proc/self/exe'): %s", strerror(errno));
-        exit(errno);
+        return false;
     }
 
     if (execv(execfile_abspath, argv) < 0) {
         LOGERR("[run_as_user] execv('%s', args): %s", execfile_abspath, strerror(errno));
-        exit(errno);
+        return false;
     }
+    return true; /* unreachable on success (execv replaces the image) */
 }
 
 int get_ipstr_family(const char *ipstr) {
@@ -257,40 +259,49 @@ static inline void set_tcp_keepalive(int sockfd) {
     }
 }
 
-static inline void set_ip_transparent(int family, int sockfd) {
+static inline bool set_ip_transparent(int family, int sockfd) {
     if (family == AF_INET) {
         if (setsockopt(sockfd, IPPROTO_IP, IP_TRANSPARENT, &(int) {
         1
     }, sizeof(int)) < 0) {
             LOGERR("[set_ip_transparent] setsockopt(%d, IP_TRANSPARENT): %s", sockfd, strerror(errno));
-            return;
+            return false;
         }
     } else {
         if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_TRANSPARENT, &(int) {
         1
     }, sizeof(int)) < 0) {
             LOGERR("[set_ip_transparent] setsockopt(%d, IPV6_TRANSPARENT): %s", sockfd, strerror(errno));
-            return;
+            return false;
         }
     }
+    return true;
 }
 
-static inline void set_recv_origdstaddr(int family, int sockfd) {
+static inline bool set_recv_origdstaddr(int family, int sockfd) {
     if (family == AF_INET) {
         if (setsockopt(sockfd, IPPROTO_IP, IP_RECVORIGDSTADDR, &(int) {
         1
     }, sizeof(int)) < 0) {
             LOGERR("[set_recv_origdstaddr] setsockopt(%d, IP_RECVORIGDSTADDR): %s", sockfd, strerror(errno));
-            return;
+            return false;
         }
     } else {
         if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_RECVORIGDSTADDR, &(int) {
         1
     }, sizeof(int)) < 0) {
             LOGERR("[set_recv_origdstaddr] setsockopt(%d, IPV6_RECVORIGDSTADDR): %s", sockfd, strerror(errno));
-            return;
+            return false;
         }
     }
+    return true;
+}
+
+static inline int close_and_fail(int sockfd) {
+    int saved_errno = errno;
+    close(sockfd);
+    errno = saved_errno;
+    return -1;
 }
 
 static inline void setup_accepted_sockfd(int sockfd) {
@@ -330,8 +341,8 @@ int new_tcp_listen_sockfd(int family, bool is_tproxy, bool is_reuse_port, bool i
     if (sockfd < 0) {
         return sockfd;
     }
-    if (is_tproxy) {
-        set_ip_transparent(family, sockfd);
+    if (is_tproxy && !set_ip_transparent(family, sockfd)) {
+        return close_and_fail(sockfd);
     }
     if (is_reuse_port) {
         set_reuse_port(sockfd);
@@ -361,8 +372,12 @@ int new_udp_tprecv_sockfd(int family, bool is_reuse_port) {
     if (sockfd < 0) {
         return sockfd;
     }
-    set_ip_transparent(family, sockfd);
-    set_recv_origdstaddr(family, sockfd);
+    if (!set_ip_transparent(family, sockfd)) {
+        return close_and_fail(sockfd);
+    }
+    if (!set_recv_origdstaddr(family, sockfd)) {
+        return close_and_fail(sockfd);
+    }
     if (is_reuse_port) {
         set_reuse_port(sockfd);
     }
@@ -374,7 +389,9 @@ int new_udp_tpsend_sockfd(int family) {
     if (sockfd < 0) {
         return sockfd;
     }
-    set_ip_transparent(family, sockfd);
+    if (!set_ip_transparent(family, sockfd)) {
+        return close_and_fail(sockfd);
+    }
     return sockfd;
 }
 
