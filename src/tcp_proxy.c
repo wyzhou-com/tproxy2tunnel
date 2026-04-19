@@ -100,7 +100,9 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, struct ev_watcher *watcher, int reve
     char ipstr[IP6STRLEN];
     portno_t portno;
 
-    int client_sockfd = tcp_accept(accept_watcher->fd, (void *)&skaddr, &(socklen_t){sizeof(skaddr)});
+    int client_sockfd = tcp_accept(accept_watcher->fd, (void *)&skaddr, &(socklen_t) {
+        sizeof(skaddr)
+    });
     if (client_sockfd < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             LOGERR("[tcp_tproxy_accept_cb] accept tcp%s socket: %s", isipv4 ? "4" : "6", strerror(errno));

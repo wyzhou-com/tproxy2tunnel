@@ -66,7 +66,7 @@ char *addr_header_build_udp(char *payload_start, const char *domain,
         memcpy(hdr->domain_str, domain, domain_len);
 
         portno_t port = isipv4 ? ((const skaddr4_t *)skaddr)->sin_port
-                                : skaddr->sin6_port;
+                        : skaddr->sin6_port;
         memcpy(hdr->domain_str + domain_len, &port, 2);
     } else {
         /* IP format */
