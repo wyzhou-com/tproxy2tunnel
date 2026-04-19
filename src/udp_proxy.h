@@ -13,7 +13,7 @@
 #include "ev_types.h"
 
 #include "lrucache.h"   /* myhash_hh, MYLRU_HASH_*, LRU_DEFINE_*  */
-#include "netutils.h"   /* ip_port_t                           */
+#include "netutils.h"   /* ip_port_t, UDP_DATAGRAM_MAXSIZ      */
 
 /* ════════════════════════════════════════════════════════════════════════
  * Cache Capacity API
@@ -30,12 +30,15 @@ void udp_lrucache_set_maxsize(uint16_t base_size);
 
 #define MEMPOOL_INITIAL_SIZE  256
 
-#define UDP_BATCH_SIZE           16
-
-#define MAX_DOMAIN_LEN        255
+#define UDP_BATCH_SIZE        16
 
 /* Maximum tunnel UDP header: ATYP(1) + LEN(1) + DOMAIN(255) + PORT(2) = 259 */
 #define MAX_TUNNEL_UDP_HEADER 259
+
+/* Batch buffer size: reserves MAX_TUNNEL_UDP_HEADER bytes in front of the
+ * payload for zero-copy header prepend, so a max-size UDP datagram can be
+ * fully received without MSG_TRUNC. */
+#define UDP_BATCH_BUFSIZ     (UDP_DATAGRAM_MAXSIZ + MAX_TUNNEL_UDP_HEADER)
 
 /* ════════════════════════════════════════════════════════════════════════
  * Cache key types
@@ -123,6 +126,7 @@ void udp_tproxyctx_clear(udp_tproxyctx_t **cache, udp_tproxyctx_cb_t cb, void *c
  * ════════════════════════════════════════════════════════════════════════ */
 
 void udp_tproxy_recvmsg_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
+void udp_proxy_thread_init(void);
 void udp_proxy_close_all_sessions(evloop_t *evloop);
 void udp_proxy_init_gc(evloop_t *evloop);
 void udp_proxy_stop_gc(evloop_t *evloop);

@@ -653,6 +653,7 @@ static void* run_event_loop(void *arg) {
     }
 
     if (should_handle_udp) {
+        udp_proxy_thread_init();
         udp_proxy_init_gc(evloop);
     }
 

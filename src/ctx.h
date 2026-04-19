@@ -56,7 +56,7 @@ extern uint16_t g_udp_idletimeout_sec;
 extern __thread udp_tunnelctx_t  *g_udp_tunnel_table;
 extern __thread udp_tunnelctx_t  *g_udp_fork_table;
 extern __thread udp_tproxyctx_t  *g_udp_tproxyctx_table;
-extern __thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_DATAGRAM_MAXSIZ];
+extern __thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_BATCH_BUFSIZ];
 extern __thread memory_pool_t *g_udp_context_pool;
 extern __thread memory_pool_t *g_udp_tproxy_pool;
 extern __thread memory_pool_t *g_tcp_context_pool;

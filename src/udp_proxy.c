@@ -26,46 +26,29 @@ _Static_assert(offsetof(udp_fork_key_t, client_ipport) == 0, "fork_key hash reli
 /* Forward declarations */
 static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, struct msghdr *msg, size_t nrecv, char *buffer);
 static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
-static void gc_release_tunnelctx(evloop_t *evloop, udp_tunnelctx_t *context);
-static void gc_release_tproxyctx(evloop_t *evloop, udp_tproxyctx_t *context);
-static void gc_sweep_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
-static void destroy_tunnelctx(evloop_t *evloop, udp_tunnelctx_t *context);
-static void destroy_tproxyctx(evloop_t *evloop, udp_tproxyctx_t *context);
+static void release_tunnelctx(evloop_t *evloop, udp_tunnelctx_t *context);
+static void release_tproxyctx(evloop_t *evloop, udp_tproxyctx_t *context);
 
-static inline void udp_tunnelctx_keepalive(evloop_t *evloop, udp_tunnelctx_t *ctx) {
-    ctx->last_active = ev_now(evloop);
-}
+/* ── Per-thread batch I/O buffers (initialized in udp_proxy_thread_init) ── */
+static __thread struct mmsghdr  g_tprecv_msgs[UDP_BATCH_SIZE];
+static __thread struct iovec    g_tprecv_iovs[UDP_BATCH_SIZE];
+static __thread char            g_tprecv_ctrl_bufs[UDP_BATCH_SIZE][UDP_CTRLMESG_BUFSIZ];
+static __thread skaddr6_t       g_tprecv_skaddrs[UDP_BATCH_SIZE];
+
+static __thread struct mmsghdr  g_tunnel_msgs[UDP_BATCH_SIZE];
+static __thread struct mmsghdr  g_tunnel_send_msgs[UDP_BATCH_SIZE];
+static __thread struct iovec    g_tunnel_iovs[UDP_BATCH_SIZE];
 
 void udp_tproxy_recvmsg_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     evio_t *tprecv_watcher = (evio_t *)watcher;
     bool isipv4 = (intptr_t)tprecv_watcher->data;
 
-    const size_t max_headerlen = MAX_TUNNEL_UDP_HEADER;
-
-    static __thread struct mmsghdr msgs[UDP_BATCH_SIZE];
-    static __thread struct iovec iovs[UDP_BATCH_SIZE];
-    static __thread char msg_control_buffers[UDP_BATCH_SIZE][UDP_CTRLMESG_BUFSIZ];
-    static __thread skaddr6_t skaddrs[UDP_BATCH_SIZE];
-    static __thread bool tproxy_recvmsg_initialized = false;
-
-    if (!tproxy_recvmsg_initialized) {
-        for (int i = 0; i < UDP_BATCH_SIZE; i++) {
-            iovs[i].iov_base            = (uint8_t *)g_udp_batch_buffer[i] + max_headerlen;
-            iovs[i].iov_len             = UDP_DATAGRAM_MAXSIZ - max_headerlen;
-            msgs[i].msg_hdr.msg_name    = &skaddrs[i];
-            msgs[i].msg_hdr.msg_iov     = &iovs[i];
-            msgs[i].msg_hdr.msg_iovlen  = 1;
-            msgs[i].msg_hdr.msg_control = msg_control_buffers[i];
-        }
-        tproxy_recvmsg_initialized = true;
-    }
-
     for (int i = 0; i < UDP_BATCH_SIZE; i++) {
-        msgs[i].msg_hdr.msg_namelen    = sizeof(skaddr6_t);
-        msgs[i].msg_hdr.msg_controllen = UDP_CTRLMESG_BUFSIZ;
+        g_tprecv_msgs[i].msg_hdr.msg_namelen    = sizeof(skaddr6_t);
+        g_tprecv_msgs[i].msg_hdr.msg_controllen = UDP_CTRLMESG_BUFSIZ;
     }
 
-    int retval = recvmmsg(tprecv_watcher->fd, msgs, UDP_BATCH_SIZE, 0, NULL);
+    int retval = recvmmsg(tprecv_watcher->fd, g_tprecv_msgs, UDP_BATCH_SIZE, 0, NULL);
 
     if (retval < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -77,11 +60,10 @@ void udp_tproxy_recvmsg_cb(evloop_t *evloop, struct ev_watcher *watcher, int rev
     if (retval == 0) return;
 
     for (int i = 0; i < retval; i++) {
-        handle_udp_socket_msg(evloop, tprecv_watcher, &msgs[i].msg_hdr, (size_t)msgs[i].msg_len, g_udp_batch_buffer[i]);
+        handle_udp_socket_msg(evloop, tprecv_watcher, &g_tprecv_msgs[i].msg_hdr, (size_t)g_tprecv_msgs[i].msg_len, g_udp_batch_buffer[i]);
     }
 }
 
-#ifdef ENABLE_PERPACKET_LOG
 static inline void log_udp_transfer(const char *funcname, const char *action,
                                     const ip_port_t *src, const ip_port_t *dst,
                                     bool is_ipv4, const char *unit, int val) {
@@ -104,7 +86,31 @@ static inline void log_udp_transfer(const char *funcname, const char *action,
                    unit, val);
     }
 }
-#endif
+
+static inline void ip_port_from_skaddr(ip_port_t *dst, const skaddr6_t *skaddr, bool isipv4) {
+    memset(dst, 0, sizeof(*dst));
+    if (isipv4) {
+        dst->ip.ip4 = ((const skaddr4_t *)skaddr)->sin_addr.s_addr;
+        dst->port   = ((const skaddr4_t *)skaddr)->sin_port;
+    } else {
+        memcpy(&dst->ip.ip6, &skaddr->sin6_addr.s6_addr, IP6BINLEN);
+        dst->port = skaddr->sin6_port;
+    }
+}
+
+static inline void skaddr_from_ip_port(skaddr6_t *dst, const ip_port_t *src, bool isipv4) {
+    memset(dst, 0, sizeof(*dst));
+    if (isipv4) {
+        skaddr4_t *addr = (void *)dst;
+        addr->sin_family      = AF_INET;
+        addr->sin_addr.s_addr = src->ip.ip4;
+        addr->sin_port        = src->port;
+    } else {
+        dst->sin6_family = AF_INET6;
+        memcpy(&dst->sin6_addr.s6_addr, &src->ip.ip6, IP6BINLEN);
+        dst->sin6_port = src->port;
+    }
+}
 
 static inline void build_fork_key(udp_fork_key_t *fk, const ip_port_t *client, const skaddr6_t *skaddr, bool isipv4) {
     memset(fk, 0, sizeof(*fk));
@@ -139,23 +145,11 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
 
     IF_VERBOSE {
         parse_socket_addr(&skaddr, ipstr, &portno);
-    }
-
-#ifdef ENABLE_PERPACKET_LOG
-    IF_VERBOSE {
         LOGINF_RAW("[handle_udp_socket_msg] recv from %s#%hu, nrecv:%zd", ipstr, portno, nrecv);
     }
-#endif
 
     ip_port_t key_ipport;
-    memset(&key_ipport, 0, sizeof(key_ipport));
-    if (isipv4) {
-        key_ipport.ip.ip4 = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
-        key_ipport.port = ((skaddr4_t *)&skaddr)->sin_port;
-    } else {
-        memcpy(&key_ipport.ip.ip6, &skaddr.sin6_addr.s6_addr, IP6BINLEN);
-        key_ipport.port = skaddr.sin6_port;
-    }
+    ip_port_from_skaddr(&key_ipport, &skaddr, isipv4);
 
     if (!get_udp_orig_dstaddr(isipv4 ? AF_INET : AF_INET6, msg, &skaddr)) {
         LOGERR("[handle_udp_socket_msg] destination address not found in udp msg");
@@ -174,14 +168,12 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
                    ((uint8_t *)&target_ip)[2], ((uint8_t *)&target_ip)[3]);
             return;
         }
-#ifdef ENABLE_PERPACKET_LOG
         IF_VERBOSE if (fake_domain) {
             LOGINF_RAW("[handle_udp_socket_msg] fakedns hit: %u.%u.%u.%u -> %s",
                        ((uint8_t *)&target_ip)[0], ((uint8_t *)&target_ip)[1],
                        ((uint8_t *)&target_ip)[2], ((uint8_t *)&target_ip)[3],
                        fake_domain);
         }
-#endif
     }
 
     /* Build tunnel header backward from payload position (zero-copy) */
@@ -189,6 +181,12 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
     char *header_start = addr_header_build_udp(payload_start, fake_domain, &skaddr, isipv4, &actual_headerlen);
     if (!header_start) {
         LOGERR("[handle_udp_socket_msg] failed to build tunnel UDP header");
+        return;
+    }
+
+    if (nrecv > UDP_DATAGRAM_MAXSIZ - actual_headerlen) {
+        LOGWAR("[handle_udp_socket_msg] packet too large to encapsulate (%zu+%zu > %d), dropping",
+               nrecv, actual_headerlen, UDP_DATAGRAM_MAXSIZ);
         return;
     }
 
@@ -211,12 +209,10 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         if (!context) {
             force_fork = true;
         } else {
-#ifdef ENABLE_PERPACKET_LOG
             IF_VERBOSE {
                 portno_t target_port = isipv4 ? ((skaddr4_t *)&skaddr)->sin_port : skaddr.sin6_port;
                 LOGINF_RAW("[handle_udp_socket_msg] reuse fork context (FakeDNS): %s#%hu -> %s#%hu", ipstr, portno, fake_domain, ntohs(target_port));
             }
-#endif
         }
     } else {
         /* Strategy B: Real IP Traffic -> Main Table (Full Cone) -> Fork Table (Fallback) */
@@ -224,18 +220,16 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
 
         if (main_ctx) {
             if (main_ctx->dest_is_ipv4 != isipv4) {
-                udp_tunnelctx_keepalive(evloop, main_ctx);
+                main_ctx->last_active = ev_now(evloop);
                 force_fork = true;
             } else {
                 context = main_ctx;
-#ifdef ENABLE_PERPACKET_LOG
                 IF_VERBOSE {
                     char target_ipstr[IP6STRLEN];
                     portno_t target_port;
                     parse_socket_addr(&skaddr, target_ipstr, &target_port);
                     LOGINF_RAW("[handle_udp_socket_msg] reuse main context (RealIP): %s#%hu -> %s#%hu", ipstr, portno, target_ipstr, target_port);
                 }
-#endif
             }
         }
 
@@ -243,14 +237,12 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
             build_fork_key(&fork_key, &key_ipport, &skaddr, isipv4);
             context = udp_tunnelctx_fork_find(&g_udp_fork_table, &fork_key);
             if (context) {
-#ifdef ENABLE_PERPACKET_LOG
                 IF_VERBOSE {
                     char target_ipstr[IP6STRLEN];
                     portno_t target_port;
                     parse_socket_addr(&skaddr, target_ipstr, &target_port);
                     LOGINF_RAW("[handle_udp_socket_msg] reuse fork context (RealIP): %s#%hu -> %s#%hu", ipstr, portno, target_ipstr, target_port);
                 }
-#endif
             }
         }
     }
@@ -276,23 +268,12 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
             close(udp_sockfd);
             return;
         }
-        memcpy(&context->key_ipport, &key_ipport, sizeof(key_ipport));
+        context->key_ipport = key_ipport;
 
         context->dest_is_ipv4 = isipv4;
         context->is_fakedns = (fake_domain != NULL);
 
-#ifndef ENABLE_PERPACKET_LOG
-        if (fake_domain)
-#endif
-        {
-            if (isipv4) {
-                context->orig_dstaddr.ip.ip4 = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
-                context->orig_dstaddr.port = ((skaddr4_t *)&skaddr)->sin_port;
-            } else {
-                memcpy(&context->orig_dstaddr.ip.ip6, &skaddr.sin6_addr.s6_addr, IP6BINLEN);
-                context->orig_dstaddr.port = skaddr.sin6_port;
-            }
-        }
+        ip_port_from_skaddr(&context->orig_dstaddr, &skaddr, isipv4);
 
         /* UDP watcher: immediately ready for receive */
         evio_t *udp_watcher = &context->udp_watcher;
@@ -302,9 +283,9 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         context->last_active = ev_now(evloop);
 
         udp_tunnelctx_t *del_context = NULL;
-        memcpy(&context->fork_key, &fork_key, sizeof(fork_key));
 
         if (force_fork) {
+            memcpy(&context->fork_key, &fork_key, sizeof(fork_key));
             context->is_forked = true;
             del_context = udp_tunnelctx_fork_add(&g_udp_fork_table, context);
             IF_VERBOSE {
@@ -331,7 +312,10 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
 
         if (del_context) {
             LOGINF("[handle_udp_socket_msg] tunnel table full, evicting least active entry");
-            destroy_tunnelctx(evloop, del_context);
+            /* LRU add already removed del_context from the table */
+            ev_io_stop(evloop, &del_context->udp_watcher);
+            close(del_context->udp_watcher.fd);
+            mempool_free_sized(g_udp_context_pool, del_context, sizeof(*del_context));
         }
 
         /* Send immediately — no handshake, no buffering */
@@ -339,87 +323,42 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         if (nsend < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 LOGERR("[handle_udp_socket_msg] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
+                if (errno == EPIPE || errno == ECONNRESET || errno == ECONNREFUSED) {
+                    release_tunnelctx(evloop, context);
+                }
             }
-        }
-#ifdef ENABLE_PERPACKET_LOG
-        else {
+        } else {
             log_udp_transfer("handle_udp_socket_msg", "send",
                              &context->key_ipport, &context->orig_dstaddr,
                              context->dest_is_ipv4, "nsend", (int)nsend);
         }
-#endif
         return;
     }
 
     /* ── Existing session: send immediately ── */
-    udp_tunnelctx_keepalive(evloop, context);
+    context->last_active = ev_now(evloop);
 
     ssize_t nsend = send(context->udp_watcher.fd, header_start, actual_headerlen + nrecv, 0);
     if (nsend < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            parse_socket_addr(&skaddr, ipstr, &portno);
-            LOGERR("[handle_udp_socket_msg] send to %s#%hu: %s", ipstr, portno, strerror(errno));
-            if (errno == EPIPE || errno == ECONNRESET) {
-                LOGWAR("[handle_udp_socket_msg] fatal send error, releasing zombie context");
-                gc_release_tunnelctx(evloop, context);
+            LOGERR("[handle_udp_socket_msg] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
+            if (errno == EPIPE || errno == ECONNRESET || errno == ECONNREFUSED) {
+                release_tunnelctx(evloop, context);
             }
         }
         return;
     }
-#ifdef ENABLE_PERPACKET_LOG
     log_udp_transfer("handle_udp_socket_msg", "send",
                      &context->key_ipport, &context->orig_dstaddr,
                      context->dest_is_ipv4, "nsend", (int)nsend);
-#endif
 }
 
 /* ── Response path: receive from tunnel server, strip header, send to client via tproxy ── */
-
-static inline void sendmmsg_fallback(udp_tunnelctx_t *tunnelctx __attribute__((unused)), udp_tproxyctx_t *tproxy_ctx, struct mmsghdr *msgs, int sent, int total) {
-    LOGWAR("[udp_tunnel_recv_cb] partial send %d/%d, using fallback", sent, total);
-    for (int k = sent; k < total; k++) {
-        struct msghdr *hdr = &msgs[k].msg_hdr;
-        ssize_t n = sendto(tproxy_ctx->udp_sockfd, hdr->msg_iov[0].iov_base,
-                           hdr->msg_iov[0].iov_len, 0, hdr->msg_name, hdr->msg_namelen);
-#ifdef ENABLE_PERPACKET_LOG
-        if (n > 0) {
-            log_udp_transfer("udp_tunnel_recv_cb", "send",
-                             &tproxy_ctx->key_ipport, &tunnelctx->key_ipport,
-                             tunnelctx->dest_is_ipv4, "nsend", (int)n);
-        }
-#endif
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            LOGERR("[udp_tunnel_recv_cb] fallback sendto failed: %s", strerror(errno));
-        }
-    }
-}
-
 static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     evio_t *udp_watcher = (evio_t *)watcher;
     udp_tunnelctx_t *tunnelctx = (void *)((uint8_t *)udp_watcher - offsetof(udp_tunnelctx_t, udp_watcher));
 
-    /* Connected socket: msg_name/msg_control are NULL — init once */
-    static __thread struct mmsghdr msgs[UDP_BATCH_SIZE];
-    static __thread struct mmsghdr send_msgs[UDP_BATCH_SIZE];
-    static __thread struct iovec iovs[UDP_BATCH_SIZE];
-    static __thread bool udpmsg_initialized = false;
-
-    if (!udpmsg_initialized) {
-        for (int i = 0; i < UDP_BATCH_SIZE; i++) {
-            iovs[i].iov_base               = g_udp_batch_buffer[i];
-            iovs[i].iov_len                = UDP_DATAGRAM_MAXSIZ;
-            msgs[i].msg_hdr.msg_name       = NULL;
-            msgs[i].msg_hdr.msg_namelen    = 0;
-            msgs[i].msg_hdr.msg_iov        = &iovs[i];
-            msgs[i].msg_hdr.msg_iovlen     = 1;
-            msgs[i].msg_hdr.msg_control    = NULL;
-            msgs[i].msg_hdr.msg_controllen = 0;
-        }
-        udpmsg_initialized = true;
-    }
-
-    int retval = recvmmsg(udp_watcher->fd, msgs, UDP_BATCH_SIZE, 0, NULL);
+    int retval = recvmmsg(udp_watcher->fd, g_tunnel_msgs, UDP_BATCH_SIZE, 0, NULL);
 
     if (retval < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -442,11 +381,11 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
     udp_tproxyctx_t *deferred_evict[UDP_BATCH_SIZE];
     int deferred_evict_count = 0;
 
-    udp_tunnelctx_keepalive(evloop, tunnelctx);
+    tunnelctx->last_active = ev_now(evloop);
 
     for (int i = 0; i < retval; i++) {
         char *buffer = g_udp_batch_buffer[i];
-        size_t nrecv = (size_t)msgs[i].msg_len;
+        size_t nrecv = (size_t)g_tunnel_msgs[i].msg_len;
 
         /* Parse tunnel header: ATYP(1) + ADDR + PORT */
         if (nrecv < sizeof(addr_hdr_ipv4_t)) continue;
@@ -469,13 +408,13 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
 
         /* Determine source (bind) address for tproxy response */
         ip_port_t fromipport;
-        memset(&fromipport, 0, sizeof(fromipport));
         bool dest_isipv4;
 
         if (tunnelctx->is_fakedns) {
             fromipport = tunnelctx->orig_dstaddr;
             dest_isipv4 = tunnelctx->dest_is_ipv4;
         } else {
+            memset(&fromipport, 0, sizeof(fromipport));
             if (isipv4) {
                 addr_hdr_ipv4_t *hdr = (addr_hdr_ipv4_t *)buffer;
                 fromipport.ip.ip4 = hdr->ipaddr4;
@@ -493,17 +432,7 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
         udp_tproxyctx_t *tproxyctx = udp_tproxyctx_find(&g_udp_tproxyctx_table, &fromipport);
         if (!tproxyctx) {
             skaddr6_t fromskaddr;
-            memset(&fromskaddr, 0, sizeof(fromskaddr));
-            if (dest_isipv4) {
-                skaddr4_t *addr = (void *)&fromskaddr;
-                addr->sin_family = AF_INET;
-                addr->sin_addr.s_addr = fromipport.ip.ip4;
-                addr->sin_port = fromipport.port;
-            } else {
-                fromskaddr.sin6_family = AF_INET6;
-                memcpy(&fromskaddr.sin6_addr.s6_addr, &fromipport.ip.ip6, IP6BINLEN);
-                fromskaddr.sin6_port = fromipport.port;
-            }
+            skaddr_from_ip_port(&fromskaddr, &fromipport, dest_isipv4);
             int tproxy_sockfd = new_udp_tpsend_sockfd(dest_isipv4 ? AF_INET : AF_INET6);
             if (tproxy_sockfd < 0) {
                 LOGERR("[udp_tunnel_recv_cb] new_udp_tpsend_sockfd failed");
@@ -523,7 +452,7 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
                 close(tproxy_sockfd);
                 continue;
             }
-            memcpy(&tproxyctx->key_ipport, &fromipport, sizeof(fromipport));
+            tproxyctx->key_ipport = fromipport;
             tproxyctx->udp_sockfd = tproxy_sockfd;
             tproxyctx->last_active = ev_now(evloop);
             udp_tproxyctx_t *del_context = udp_tproxyctx_add(&g_udp_tproxyctx_table, tproxyctx);
@@ -549,18 +478,7 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
         }
 
         /* Prepare destination address */
-        ip_port_t *toipport = &tunnelctx->key_ipport;
-        memset(&batch_sends[send_count].addr, 0, sizeof(skaddr6_t));
-        if (dest_isipv4) {
-            skaddr4_t *addr = (void *)&batch_sends[send_count].addr;
-            addr->sin_family = AF_INET;
-            addr->sin_addr.s_addr = toipport->ip.ip4;
-            addr->sin_port = toipport->port;
-        } else {
-            batch_sends[send_count].addr.sin6_family = AF_INET6;
-            memcpy(&batch_sends[send_count].addr.sin6_addr.s6_addr, &toipport->ip.ip6, IP6BINLEN);
-            batch_sends[send_count].addr.sin6_port = toipport->port;
-        }
+        skaddr_from_ip_port(&batch_sends[send_count].addr, &tunnelctx->key_ipport, dest_isipv4);
 
         /* Prepare send message — strip tunnel header, send payload only */
         batch_sends[send_count].ctx                        = tproxyctx;
@@ -579,113 +497,73 @@ static void udp_tunnel_recv_cb(evloop_t *evloop, struct ev_watcher *watcher, int
 
     /* Batch send using sendmmsg — group by tproxy socket */
     if (send_count > 0) {
-        udp_tproxyctx_t *first_ctx = batch_sends[0].ctx;
-        bool all_same = true;
-        for (int k = 1; k < send_count; k++) {
-            if (batch_sends[k].ctx != first_ctx) {
-                all_same = false;
-                break;
-            }
+        uint16_t indices[UDP_BATCH_SIZE];
+        for (int k = 0; k < send_count; k++) {
+            indices[k] = (uint16_t)k;
         }
 
-        if (all_same) {
-            for (int k = 0; k < send_count; k++) {
-                send_msgs[k] = batch_sends[k].msg;
+        for (int i = 0; i < send_count;) {
+            udp_tproxyctx_t *ctx = batch_sends[indices[i]].ctx;
+            int group_count = 0;
+
+            for (int j = i; j < send_count; j++) {
+                if (batch_sends[indices[j]].ctx == ctx) {
+                    if (j != i + group_count) {
+                        uint16_t tmp = indices[i + group_count];
+                        indices[i + group_count] = indices[j];
+                        indices[j] = tmp;
+                    }
+                    group_count++;
+                }
             }
-            int sent = sendmmsg(first_ctx->udp_sockfd, send_msgs, (unsigned int)send_count, 0);
+
+            for (int k = 0; k < group_count; k++) {
+                g_tunnel_send_msgs[k] = batch_sends[indices[i + k]].msg;
+            }
+
+            int sent = sendmmsg(ctx->udp_sockfd, g_tunnel_send_msgs, (unsigned int)group_count, 0);
             if (sent < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     LOGERR("[udp_tunnel_recv_cb] sendmmsg failed: %s", strerror(errno));
                 }
             } else {
-#ifdef ENABLE_PERPACKET_LOG
+                if (sent < group_count) {
+                    LOGWAR("[udp_tunnel_recv_cb] sendmmsg partial: sent=%d/%d, dropped=%d",
+                           sent, group_count, group_count - sent);
+                }
                 log_udp_transfer("udp_tunnel_recv_cb", "sendmmsg",
-                                 &first_ctx->key_ipport, &tunnelctx->key_ipport,
+                                 &ctx->key_ipport, &tunnelctx->key_ipport,
                                  tunnelctx->dest_is_ipv4, "npackets", sent);
-#endif
-                if (sent < send_count) {
-                    sendmmsg_fallback(tunnelctx, first_ctx, send_msgs, sent, send_count);
-                }
-            }
-        } else {
-            /* Slow path: multiple tproxy sockets — group by ctx pointer */
-            uint16_t indices[UDP_BATCH_SIZE];
-            for (int k = 0; k < send_count; k++) {
-                indices[k] = (uint16_t)k;
             }
 
-            for (int i = 0; i < send_count;) {
-                udp_tproxyctx_t *ctx = batch_sends[indices[i]].ctx;
-                int group_start = i;
-                int group_count = 0;
-
-                for (int j = i; j < send_count; j++) {
-                    if (batch_sends[indices[j]].ctx == ctx) {
-                        if (j != i + group_count) {
-                            uint16_t tmp = indices[i + group_count];
-                            indices[i + group_count] = indices[j];
-                            indices[j] = tmp;
-                        }
-                        group_count++;
-                    }
-                }
-
-                for (int k = 0; k < group_count; k++) {
-                    send_msgs[k] = batch_sends[indices[group_start + k]].msg;
-                }
-
-                int sent = sendmmsg(ctx->udp_sockfd, send_msgs, (unsigned int)group_count, 0);
-                if (sent < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        LOGERR("[udp_tunnel_recv_cb] sendmmsg failed: %s", strerror(errno));
-                    }
-                } else {
-#ifdef ENABLE_PERPACKET_LOG
-                    log_udp_transfer("udp_tunnel_recv_cb", "sendmmsg",
-                                     &ctx->key_ipport, &tunnelctx->key_ipport,
-                                     tunnelctx->dest_is_ipv4, "npackets", sent);
-#endif
-                    if (sent < group_count) {
-                        sendmmsg_fallback(tunnelctx, ctx, send_msgs, sent, group_count);
-                    }
-                }
-
-                i += group_count;
-            }
+            i += group_count;
         }
     }
 
-    /* Flush deferred evictions */
+    /* Flush deferred evictions — LRU add already removed these from the table */
     for (int i = 0; i < deferred_evict_count; i++) {
-        destroy_tproxyctx(evloop, deferred_evict[i]);
+        close(deferred_evict[i]->udp_sockfd);
+        mempool_free_sized(g_udp_tproxy_pool, deferred_evict[i], sizeof(*deferred_evict[i]));
     }
 }
 
 /* ── Release helpers ── */
 
-static void destroy_tunnelctx(evloop_t *evloop, udp_tunnelctx_t *context) {
-    ev_io_stop(evloop, &context->udp_watcher);
-    close(context->udp_watcher.fd);
-    mempool_free_sized(g_udp_context_pool, context, sizeof(*context));
-}
-
-static void destroy_tproxyctx(evloop_t *evloop __attribute__((unused)), udp_tproxyctx_t *context) {
-    close(context->udp_sockfd);
-    mempool_free_sized(g_udp_tproxy_pool, context, sizeof(*context));
-}
-
-static void gc_release_tunnelctx(evloop_t *evloop, udp_tunnelctx_t *context) {
+static void release_tunnelctx(evloop_t *evloop, udp_tunnelctx_t *context) {
     if (context->is_forked) {
         udp_tunnelctx_del(&g_udp_fork_table, context);
     } else {
         udp_tunnelctx_del(&g_udp_tunnel_table, context);
     }
-    destroy_tunnelctx(evloop, context);
+    ev_io_stop(evloop, &context->udp_watcher);
+    close(context->udp_watcher.fd);
+    mempool_free_sized(g_udp_context_pool, context, sizeof(*context));
 }
 
-static void gc_release_tproxyctx(evloop_t *evloop, udp_tproxyctx_t *context) {
+static void release_tproxyctx(evloop_t *evloop __attribute__((unused)), udp_tproxyctx_t *context) {
     udp_tproxyctx_del(&g_udp_tproxyctx_table, context);
-    destroy_tproxyctx(evloop, context);
+    close(context->udp_sockfd);
+    mempool_free_sized(g_udp_tproxy_pool, context, sizeof(*context));
 }
 
 /* ── GC: sweep callback ── */
@@ -707,7 +585,7 @@ static void gc_sweep_cb(evloop_t *evloop, struct ev_watcher *watcher __attribute
         udp_tunnelctx_t *cur, *tmp;
         MYLRU_HASH_FOR(g_udp_tunnel_table, cur, tmp) {
             if ((now - cur->last_active) >= idle_timeout) {
-                gc_release_tunnelctx(evloop, cur);
+                release_tunnelctx(evloop, cur);
                 evicted++;
             }
         }
@@ -721,7 +599,7 @@ static void gc_sweep_cb(evloop_t *evloop, struct ev_watcher *watcher __attribute
         udp_tunnelctx_t *cur, *tmp;
         MYLRU_HASH_FOR(g_udp_fork_table, cur, tmp) {
             if ((now - cur->last_active) >= idle_timeout) {
-                gc_release_tunnelctx(evloop, cur);
+                release_tunnelctx(evloop, cur);
                 evicted++;
             }
         }
@@ -735,7 +613,7 @@ static void gc_sweep_cb(evloop_t *evloop, struct ev_watcher *watcher __attribute
         udp_tproxyctx_t *cur, *tmp;
         MYLRU_HASH_FOR(g_udp_tproxyctx_table, cur, tmp) {
             if ((now - cur->last_active) >= tproxy_timeout) {
-                gc_release_tproxyctx(evloop, cur);
+                release_tproxyctx(evloop, cur);
                 evicted++;
             }
         }
@@ -757,11 +635,31 @@ void udp_proxy_stop_gc(evloop_t *evloop) {
 /* ── Session cleanup wrappers ── */
 
 static void wrapper_tunnel_release_cb(void *evloop_ctx, udp_tunnelctx_t *entry) {
-    gc_release_tunnelctx((evloop_t *)evloop_ctx, entry);
+    release_tunnelctx((evloop_t *)evloop_ctx, entry);
 }
 
 static void wrapper_tproxy_release_cb(void *evloop_ctx, udp_tproxyctx_t *entry) {
-    gc_release_tproxyctx((evloop_t *)evloop_ctx, entry);
+    release_tproxyctx((evloop_t *)evloop_ctx, entry);
+}
+
+void udp_proxy_thread_init(void) {
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
+        g_tprecv_iovs[i].iov_base            = (uint8_t *)g_udp_batch_buffer[i] + MAX_TUNNEL_UDP_HEADER;
+        g_tprecv_iovs[i].iov_len             = UDP_DATAGRAM_MAXSIZ;
+        g_tprecv_msgs[i].msg_hdr.msg_name    = &g_tprecv_skaddrs[i];
+        g_tprecv_msgs[i].msg_hdr.msg_iov     = &g_tprecv_iovs[i];
+        g_tprecv_msgs[i].msg_hdr.msg_iovlen  = 1;
+        g_tprecv_msgs[i].msg_hdr.msg_control = g_tprecv_ctrl_bufs[i];
+
+        g_tunnel_iovs[i].iov_base               = g_udp_batch_buffer[i];
+        g_tunnel_iovs[i].iov_len                = UDP_DATAGRAM_MAXSIZ;
+        g_tunnel_msgs[i].msg_hdr.msg_name       = NULL;
+        g_tunnel_msgs[i].msg_hdr.msg_namelen    = 0;
+        g_tunnel_msgs[i].msg_hdr.msg_iov        = &g_tunnel_iovs[i];
+        g_tunnel_msgs[i].msg_hdr.msg_iovlen     = 1;
+        g_tunnel_msgs[i].msg_hdr.msg_control    = NULL;
+        g_tunnel_msgs[i].msg_hdr.msg_controllen = 0;
+    }
 }
 
 void udp_proxy_close_all_sessions(evloop_t *evloop) {

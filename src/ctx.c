@@ -25,7 +25,7 @@ uint16_t g_udp_idletimeout_sec                           = 60;
 __thread udp_tunnelctx_t  *g_udp_tunnel_table            = NULL;
 __thread udp_tunnelctx_t  *g_udp_fork_table              = NULL;
 __thread udp_tproxyctx_t  *g_udp_tproxyctx_table         = NULL;
-__thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_DATAGRAM_MAXSIZ];
+__thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_BATCH_BUFSIZ];
 __thread memory_pool_t *g_udp_context_pool               = NULL;
 __thread memory_pool_t *g_udp_tproxy_pool                = NULL;
 __thread memory_pool_t *g_tcp_context_pool               = NULL;
