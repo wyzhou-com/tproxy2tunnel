@@ -35,20 +35,19 @@ typedef struct {
     const char *peer_name;
 } tcp_stream_side_t;
 
-/* Forward declarations */
-static void tcp_connect_timeout_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
-static void tcp_tunnel_connect_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
-static void tcp_tunnel_send_header_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
-static bool prepare_tcp_tunnel_header(int client_sockfd, bool isipv4,
-                                      uint8_t addr_hdr[], size_t *addr_hdr_len);
-static int connect_tcp_tunnel(const uint8_t *addr_hdr, size_t addr_hdr_len,
+static void tcp_tunnel_on_setup_timeout(evloop_t *evloop, struct ev_watcher *watcher, int revents);
+static void tcp_tunnel_on_connected(evloop_t *evloop, struct ev_watcher *watcher, int revents);
+static void tcp_tunnel_on_writable(evloop_t *evloop, struct ev_watcher *watcher, int revents);
+static bool tcp_setup_prepare_header(int client_sockfd, bool isipv4,
+                                     uint8_t addr_hdr[], size_t *addr_hdr_len);
+static int tcp_tunnel_connect(const uint8_t *addr_hdr, size_t addr_hdr_len,
                               ssize_t *tfo_nsend);
-static tcp_session_t *create_tcp_session(int client_sockfd, int remote_sockfd,
+static tcp_session_t *tcp_session_create(int client_sockfd, int remote_sockfd,
         const uint8_t *addr_hdr, size_t addr_hdr_len,
         ssize_t tfo_nsend);
-static bool tcp_handshake_done(evloop_t *evloop, tcp_session_t *session);
-static bool tcp_start_forwarding(evloop_t *evloop, tcp_session_t *session);
-static void tcp_stream_payload_forward_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
+static bool tcp_session_enter_forwarding(evloop_t *evloop, tcp_session_t *session);
+static bool tcp_stream_start_forwarding(evloop_t *evloop, tcp_session_t *session);
+static void tcp_stream_on_forward(evloop_t *evloop, struct ev_watcher *watcher, int revents);
 
 static inline tcp_session_t *tcp_session_from_watcher(evio_t *watcher) {
     return (tcp_session_t *)watcher->data;
@@ -85,7 +84,7 @@ static inline void ev_io_add_event(evloop_t *evloop, evio_t *w, int event) {
     ev_io_start(evloop, w);
 }
 
-static inline void release_tcp_session(evloop_t *evloop, tcp_session_t *session, bool is_tcp_reset) {
+static inline void tcp_session_release(evloop_t *evloop, tcp_session_t *session, bool is_tcp_reset) {
     evio_t *client_watcher = &session->client_watcher;
     evio_t *remote_watcher = &session->remote_watcher;
     assert(client_watcher->fd >= 0);
@@ -119,23 +118,23 @@ static inline void release_tcp_session(evloop_t *evloop, tcp_session_t *session,
 }
 
 void tcp_proxy_close_all_sessions(evloop_t *evloop) {
-    LOGINF("[tcp_proxy_close_all_sessions] cleaning up remaining sessions...");
+    LOGINF("[tcp_proxy] cleaning up remaining sessions...");
     tcp_session_t *curr = g_tcp_session_head;
     while (curr) {
         tcp_session_t *next = curr->next;
-        release_tcp_session(evloop, curr, false);
+        tcp_session_release(evloop, curr, false);
         curr = next;
     }
 }
 
-static void tcp_connect_timeout_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
+static void tcp_tunnel_on_setup_timeout(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     tcp_session_t *session = (tcp_session_t *)watcher->data;
-    LOGERR("[tcp_connect_timeout_cb] connect/header-send timed out (%gs), closing", TCP_CONNECT_TIMEOUT_SEC);
-    release_tcp_session(evloop, session, true);
+    LOGERR("[tcp_tunnel] connect/header-send timed out (%gs), closing", TCP_CONNECT_TIMEOUT_SEC);
+    tcp_session_release(evloop, session, true);
 }
 
-static bool prepare_tcp_tunnel_header(int client_sockfd, bool isipv4,
-                                      uint8_t addr_hdr[], size_t *addr_hdr_len) {
+static bool tcp_setup_prepare_header(int client_sockfd, bool isipv4,
+                                     uint8_t addr_hdr[], size_t *addr_hdr_len) {
     skaddr6_t skaddr;
     char ipstr[IP6STRLEN];
     portno_t portno;
@@ -145,7 +144,7 @@ static bool prepare_tcp_tunnel_header(int client_sockfd, bool isipv4,
     }
     IF_VERBOSE {
         parse_socket_addr(&skaddr, ipstr, &portno);
-        LOGINF_RAW("[prepare_tcp_tunnel_header] target socket address: %s#%hu", ipstr, portno);
+        LOGINF_RAW("[tcp_setup] target socket address: %s#%hu", ipstr, portno);
     }
 
     const char *fake_domain = NULL;
@@ -154,13 +153,13 @@ static bool prepare_tcp_tunnel_header(int client_sockfd, bool isipv4,
         bool is_miss;
         fake_domain = fakedns_try_resolve(target_ip, &is_miss);
         if (is_miss) {
-            LOGERR("[prepare_tcp_tunnel_header] fakedns miss for FakeIP: %u.%u.%u.%u, dropping connection",
+            LOGERR("[tcp_fakedns] miss for FakeIP: %u.%u.%u.%u, dropping connection",
                    ((uint8_t *)&target_ip)[0], ((uint8_t *)&target_ip)[1],
                    ((uint8_t *)&target_ip)[2], ((uint8_t *)&target_ip)[3]);
             return false;
         }
         IF_VERBOSE if (fake_domain) {
-            LOGINF_RAW("[prepare_tcp_tunnel_header] fakedns hit: %u.%u.%u.%u -> %s",
+            LOGINF_RAW("[tcp_fakedns] hit: %u.%u.%u.%u -> %s",
                        ((uint8_t *)&target_ip)[0], ((uint8_t *)&target_ip)[1],
                        ((uint8_t *)&target_ip)[2], ((uint8_t *)&target_ip)[3],
                        fake_domain);
@@ -168,17 +167,17 @@ static bool prepare_tcp_tunnel_header(int client_sockfd, bool isipv4,
     }
 
     if (!addr_header_build(addr_hdr, TCP_ADDR_HDR_MAXLEN, &skaddr, fake_domain, addr_hdr_len)) {
-        LOGERR("[prepare_tcp_tunnel_header] failed to build tunnel address header");
+        LOGERR("[tcp_setup] failed to build tunnel address header");
         return false;
     }
     return true;
 }
 
-static int connect_tcp_tunnel(const uint8_t *addr_hdr, size_t addr_hdr_len,
+static int tcp_tunnel_connect(const uint8_t *addr_hdr, size_t addr_hdr_len,
                               ssize_t *tfo_nsend) {
     int remote_sockfd = new_tcp_connect_sockfd(g_server_skaddr.sin6_family, g_tcp_syncnt_max);
     if (remote_sockfd < 0) {
-        LOGERR("[connect_tcp_tunnel] new_tcp_connect_sockfd: %s", strerror(errno));
+        LOGERR("[tcp_tunnel] new_tcp_connect_sockfd: %s", strerror(errno));
         return -1;
     }
 
@@ -191,25 +190,25 @@ static int connect_tcp_tunnel(const uint8_t *addr_hdr, size_t addr_hdr_len,
 
     *tfo_nsend = -1;
     if (!tcp_connect(remote_sockfd, &g_server_skaddr, tfo_data, tfo_datalen, tfo_nsend)) {
-        LOGERR("[connect_tcp_tunnel] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
+        LOGERR("[tcp_tunnel] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
         close(remote_sockfd);
         return -1;
     }
     if (*tfo_nsend >= 0) {
-        LOGINF("[connect_tcp_tunnel] tfo send to %s#%hu, nsend:%zd", g_server_ipstr, g_server_portno, *tfo_nsend);
+        LOGINF("[tcp_tunnel] tfo send to %s#%hu, nsend:%zd", g_server_ipstr, g_server_portno, *tfo_nsend);
     } else {
-        LOGINF("[connect_tcp_tunnel] try to connect to %s#%hu ...", g_server_ipstr, g_server_portno);
+        LOGINF("[tcp_tunnel] try to connect to %s#%hu ...", g_server_ipstr, g_server_portno);
     }
 
     return remote_sockfd;
 }
 
-static tcp_session_t *create_tcp_session(int client_sockfd, int remote_sockfd,
+static tcp_session_t *tcp_session_create(int client_sockfd, int remote_sockfd,
         const uint8_t *addr_hdr, size_t addr_hdr_len,
         ssize_t tfo_nsend) {
     tcp_session_t *session = mempool_alloc_sized(g_tcp_session_pool, sizeof(*session));
     if (!session) {
-        LOGERR("[create_tcp_session] mempool alloc failed");
+        LOGERR("[tcp_session] mempool alloc failed");
         return NULL;
     }
     session->client_pipefd[0] = session->client_pipefd[1] = -1;
@@ -217,15 +216,15 @@ static tcp_session_t *create_tcp_session(int client_sockfd, int remote_sockfd,
 
     session->client_watcher.data = session;
     session->remote_watcher.data = session;
-    ev_io_init(&session->client_watcher, tcp_stream_payload_forward_cb, client_sockfd, EV_READ);
-    ev_io_init(&session->remote_watcher, tcp_tunnel_connect_cb, remote_sockfd, EV_WRITE);
+    ev_io_init(&session->client_watcher, tcp_stream_on_forward, client_sockfd, EV_READ);
+    ev_io_init(&session->remote_watcher, tcp_tunnel_on_connected, remote_sockfd, EV_WRITE);
 
     memcpy(session->hs.addr_hdr, addr_hdr, addr_hdr_len);
     session->hs.addr_hdr_len = (uint16_t)addr_hdr_len;
     session->hs.send_offset = (uint16_t)(tfo_nsend >= 0 ? tfo_nsend : 0);
 
     session->connect_timer.data = session;
-    ev_timer_init(&session->connect_timer, tcp_connect_timeout_cb, TCP_CONNECT_TIMEOUT_SEC, 0.);
+    ev_timer_init(&session->connect_timer, tcp_tunnel_on_setup_timeout, TCP_CONNECT_TIMEOUT_SEC, 0.);
 
     session->prev = NULL;
     session->next = g_tcp_session_head;
@@ -235,7 +234,7 @@ static tcp_session_t *create_tcp_session(int client_sockfd, int remote_sockfd,
     return session;
 }
 
-void tcp_tproxy_accept_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
+void tcp_proxy_on_accept(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     evio_t *accept_watcher = (evio_t *)watcher;
     bool isipv4 = (intptr_t)accept_watcher->data;
     skaddr6_t skaddr;
@@ -247,30 +246,30 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, struct ev_watcher *watcher, int reve
     });
     if (client_sockfd < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            LOGERR("[tcp_tproxy_accept_cb] accept tcp%s socket: %s", isipv4 ? "4" : "6", strerror(errno));
+            LOGERR("[tcp_proxy] accept tcp%s socket: %s", isipv4 ? "4" : "6", strerror(errno));
         }
         return;
     }
     IF_VERBOSE {
         parse_socket_addr(&skaddr, ipstr, &portno);
-        LOGINF_RAW("[tcp_tproxy_accept_cb] source socket address: %s#%hu", ipstr, portno);
+        LOGINF_RAW("[tcp_proxy] source socket address: %s#%hu", ipstr, portno);
     }
 
     uint8_t addr_hdr_buf[TCP_ADDR_HDR_MAXLEN];
     size_t addr_hdr_len = 0;
-    if (!prepare_tcp_tunnel_header(client_sockfd, isipv4, addr_hdr_buf, &addr_hdr_len)) {
+    if (!tcp_setup_prepare_header(client_sockfd, isipv4, addr_hdr_buf, &addr_hdr_len)) {
         tcp_close_by_rst(client_sockfd);
         return;
     }
 
     ssize_t tfo_nsend = -1;
-    int remote_sockfd = connect_tcp_tunnel(addr_hdr_buf, addr_hdr_len, &tfo_nsend);
+    int remote_sockfd = tcp_tunnel_connect(addr_hdr_buf, addr_hdr_len, &tfo_nsend);
     if (remote_sockfd < 0) {
         tcp_close_by_rst(client_sockfd);
         return;
     }
 
-    tcp_session_t *session = create_tcp_session(client_sockfd, remote_sockfd,
+    tcp_session_t *session = tcp_session_create(client_sockfd, remote_sockfd,
                              addr_hdr_buf, addr_hdr_len,
                              tfo_nsend);
     if (!session) {
@@ -283,40 +282,38 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, struct ev_watcher *watcher, int reve
     ev_timer_start(evloop, &session->connect_timer);
 }
 
-/* ── Tunnel callbacks: connect → send header → forward ── */
-
-static bool tcp_handshake_done(evloop_t *evloop, tcp_session_t *session) {
+static bool tcp_session_enter_forwarding(evloop_t *evloop, tcp_session_t *session) {
     evio_t *remote_watcher = &session->remote_watcher;
     ev_io_stop(evloop, remote_watcher);
-    ev_io_init(remote_watcher, tcp_stream_payload_forward_cb, remote_watcher->fd, EV_READ);
-    if (!tcp_start_forwarding(evloop, session)) return false;
+    ev_io_init(remote_watcher, tcp_stream_on_forward, remote_watcher->fd, EV_READ);
+    if (!tcp_stream_start_forwarding(evloop, session)) return false;
     ev_io_start(evloop, remote_watcher);
     return true;
 }
 
-static void tcp_tunnel_connect_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
+static void tcp_tunnel_on_connected(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     evio_t *remote_watcher = (evio_t *)watcher;
     tcp_session_t *session = tcp_session_from_watcher(remote_watcher);
     if (tcp_has_error(remote_watcher->fd)) {
-        LOGERR("[tcp_tunnel_connect_cb] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
-        release_tcp_session(evloop, session, true);
+        LOGERR("[tcp_tunnel] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
+        tcp_session_release(evloop, session, true);
         return;
     }
-    LOGINF("[tcp_tunnel_connect_cb] connect to %s#%hu succeeded", g_server_ipstr, g_server_portno);
+    LOGINF("[tcp_tunnel] connect to %s#%hu succeeded", g_server_ipstr, g_server_portno);
 
     if (session->hs.send_offset >= session->hs.addr_hdr_len) {
-        /* TFO path: header was piggybacked on SYN, handshake now confirmed —
+        /* TFO path: header was piggybacked on SYN, connect is now confirmed —
          * skip the header-send stage and go straight to forwarding. */
-        (void)tcp_handshake_done(evloop, session);
+        (void)tcp_session_enter_forwarding(evloop, session);
         return;
     }
 
-    ev_set_cb(remote_watcher, tcp_tunnel_send_header_cb);
+    ev_set_cb(remote_watcher, tcp_tunnel_on_writable);
     ev_invoke(evloop, remote_watcher, EV_WRITE);
 }
 
 /* return: -1(error_occurred); 0(partial_sent); 1(completely_sent) */
-static int tcp_send_header_partial(evloop_t *evloop, tcp_session_t *session) {
+static int tcp_tunnel_send_header_partial(evloop_t *evloop, tcp_session_t *session) {
     evio_t *remote_watcher = &session->remote_watcher;
     const uint8_t *addr_hdr = session->hs.addr_hdr;
     size_t addr_hdr_len = session->hs.addr_hdr_len;
@@ -324,13 +321,13 @@ static int tcp_send_header_partial(evloop_t *evloop, tcp_session_t *session) {
     ssize_t nsend = send(remote_watcher->fd, addr_hdr + *send_offset, addr_hdr_len - *send_offset, 0);
     if (nsend < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            LOGERR("[tcp_tunnel_send_header_cb] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
-            release_tcp_session(evloop, session, true);
+            LOGERR("[tcp_tunnel] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
+            tcp_session_release(evloop, session, true);
             return -1;
         }
         return 0;
     }
-    LOGINF("[tcp_tunnel_send_header_cb] send to %s#%hu, nsend:%zd", g_server_ipstr, g_server_portno, nsend);
+    LOGINF("[tcp_tunnel] send to %s#%hu, nsend:%zd", g_server_ipstr, g_server_portno, nsend);
     *send_offset += (uint16_t)nsend;
     if (*send_offset >= addr_hdr_len) {
         return 1;
@@ -338,44 +335,40 @@ static int tcp_send_header_partial(evloop_t *evloop, tcp_session_t *session) {
     return 0;
 }
 
-static void tcp_tunnel_send_header_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
+static void tcp_tunnel_on_writable(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     evio_t *remote_watcher = (evio_t *)watcher;
     tcp_session_t *session = tcp_session_from_watcher(remote_watcher);
-    if (tcp_send_header_partial(evloop, session) != 1) {
+    if (tcp_tunnel_send_header_partial(evloop, session) != 1) {
         return; /* partial or error */
     }
     /* Header fully sent — go straight to forwarding (no response to wait for) */
-    (void)tcp_handshake_done(evloop, session);
+    (void)tcp_session_enter_forwarding(evloop, session);
 }
 
-/* ── Shared helper: transition to forwarding ── */
-
-static bool tcp_start_forwarding(evloop_t *evloop, tcp_session_t *session) {
+static bool tcp_stream_start_forwarding(evloop_t *evloop, tcp_session_t *session) {
     session->fwd.client_eof = false;
     session->fwd.remote_eof = false;
     session->fwd.client_pending = 0;
     session->fwd.remote_pending = 0;
 
     if (new_nonblock_pipefd(session->client_pipefd) < 0) {
-        LOGERR("[tcp_start_forwarding] failed to create client pipe");
-        release_tcp_session(evloop, session, true);
+        LOGERR("[tcp_stream] failed to create client pipe");
+        tcp_session_release(evloop, session, true);
         return false;
     }
     if (new_nonblock_pipefd(session->remote_pipefd) < 0) {
-        LOGERR("[tcp_start_forwarding] failed to create remote pipe");
-        release_tcp_session(evloop, session, true);
+        LOGERR("[tcp_stream] failed to create remote pipe");
+        tcp_session_release(evloop, session, true);
         return false;
     }
 
     ev_timer_stop(evloop, &session->connect_timer);
     ev_io_start(evloop, &session->client_watcher);
-    LOGINF("[tcp_start_forwarding] tunnel is ready, start forwarding ...");
+    LOGINF("[tcp_stream] tunnel is ready, start forwarding ...");
     return true;
 }
 
-/* ── Bidirectional splice-based forwarding ── */
-
-static void tcp_stream_payload_forward_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents) {
+static void tcp_stream_on_forward(evloop_t *evloop, struct ev_watcher *watcher, int revents) {
     evio_t *self_watcher = (evio_t *)watcher;
     tcp_session_t *session = tcp_session_from_watcher(self_watcher);
     tcp_stream_side_t side = tcp_stream_side_from_watcher(session, self_watcher);
@@ -386,20 +379,20 @@ static void tcp_stream_payload_forward_cb(evloop_t *evloop, struct ev_watcher *w
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 if (errno == ECONNRESET) {
                     IF_VERBOSE {
-                        LOGINF_RAW("[tcp_stream_payload_forward_cb] recv from %s stream: %s, cascade RST", side.self_name, strerror(errno));
+                        LOGINF_RAW("[tcp_stream] recv from %s stream: %s, cascade RST", side.self_name, strerror(errno));
                     }
                 } else {
                     IF_VERBOSE {
-                        LOGERR("[tcp_stream_payload_forward_cb] recv from %s stream: %s", side.self_name, strerror(errno));
+                        LOGERR("[tcp_stream] recv from %s stream: %s", side.self_name, strerror(errno));
                     }
                 }
-                release_tcp_session(evloop, session, true);
+                tcp_session_release(evloop, session, true);
                 return;
             }
             goto DO_WRITE;
         }
         if (nrecv == 0) {
-            LOGINF("[tcp_stream_payload_forward_cb] recv FIN from %s stream", side.self_name);
+            LOGINF("[tcp_stream] recv FIN from %s stream", side.self_name);
             *side.self_eof = true;
             ev_io_remove_event(evloop, side.self_watcher, EV_READ);
 
@@ -412,12 +405,12 @@ static void tcp_stream_payload_forward_cb(evloop_t *evloop, struct ev_watcher *w
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     if (errno == EPIPE || errno == ECONNRESET) {
                         IF_VERBOSE {
-                            LOGINF_RAW("[tcp_stream_payload_forward_cb] send to %s stream: %s, cascade RST", side.peer_name, strerror(errno));
+                            LOGINF_RAW("[tcp_stream] send to %s stream: %s, cascade RST", side.peer_name, strerror(errno));
                         }
                     } else {
-                        LOGERR("[tcp_stream_payload_forward_cb] send to %s stream: %s", side.peer_name, strerror(errno));
+                        LOGERR("[tcp_stream] send to %s stream: %s", side.peer_name, strerror(errno));
                     }
-                    release_tcp_session(evloop, session, true);
+                    tcp_session_release(evloop, session, true);
                     return;
                 }
                 nsend = 0;
@@ -437,12 +430,12 @@ DO_WRITE:
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 if (errno == EPIPE || errno == ECONNRESET) {
                     IF_VERBOSE {
-                        LOGINF_RAW("[tcp_stream_payload_forward_cb] send to %s stream: %s, cascade RST", side.self_name, strerror(errno));
+                        LOGINF_RAW("[tcp_stream] send to %s stream: %s, cascade RST", side.self_name, strerror(errno));
                     }
                 } else {
-                    LOGERR("[tcp_stream_payload_forward_cb] send to %s stream: %s", side.self_name, strerror(errno));
+                    LOGERR("[tcp_stream] send to %s stream: %s", side.self_name, strerror(errno));
                 }
-                release_tcp_session(evloop, session, true);
+                tcp_session_release(evloop, session, true);
             }
             return;
         }
@@ -463,7 +456,7 @@ DO_WRITE:
 
     if (session->fwd.client_eof && session->fwd.remote_eof &&
             session->fwd.client_pending == 0 && session->fwd.remote_pending == 0) {
-        LOGINF("[tcp_stream_payload_forward_cb] both streams are EOF and pipes are empty, release session");
-        release_tcp_session(evloop, session, false);
+        LOGINF("[tcp_stream] both streams are EOF and pipes are empty, release session");
+        tcp_session_release(evloop, session, false);
     }
 }

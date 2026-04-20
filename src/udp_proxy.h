@@ -62,7 +62,7 @@ typedef struct udp_main_node udp_main_node_t;
 typedef struct udp_fork_node udp_fork_node_t;
 
 typedef struct udp_session {
-    /* Must stay at offset 0: udp_tunnel_recv_cb recovers the session via offsetof. */
+    /* Must stay at offset 0: udp_tunnel_on_reply recovers the session via offsetof. */
     evio_t             udp_watcher;
 
     udp_endpoint_key_t client;       /* reply destination */
@@ -118,10 +118,10 @@ void udp_main_node_clear(udp_main_node_t **cache, udp_main_node_cb_t cb, void *c
 void udp_fork_node_clear(udp_fork_node_t **cache, udp_fork_node_cb_t cb, void *ctx);
 void udp_tproxy_entry_clear(udp_tproxy_entry_t **cache, udp_tproxy_entry_cb_t cb, void *ctx);
 
-void udp_tproxy_recvmsg_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
+void udp_proxy_on_recvmsg(evloop_t *evloop, struct ev_watcher *watcher, int revents);
 void udp_proxy_thread_init(void);
 void udp_proxy_close_all_sessions(evloop_t *evloop);
-void udp_proxy_init_gc(evloop_t *evloop);
-void udp_proxy_stop_gc(evloop_t *evloop);
+void udp_proxy_gc_start(evloop_t *evloop);
+void udp_proxy_gc_stop(evloop_t *evloop);
 
 #endif /* TPROXY2TUNNEL_UDP_PROXY_H */
