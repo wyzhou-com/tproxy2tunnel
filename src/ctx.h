@@ -8,6 +8,7 @@
 
 #include "mempool.h"
 #include "netutils.h"
+#include "tcp_proxy.h"
 #include "udp_proxy.h"
 
 #define MAX_THREADS 64
@@ -63,8 +64,8 @@ extern __thread memory_pool_t *g_udp_session_pool;
 extern __thread memory_pool_t *g_udp_main_node_pool;
 extern __thread memory_pool_t *g_udp_fork_node_pool;
 extern __thread memory_pool_t *g_udp_tproxy_pool;
-extern __thread memory_pool_t *g_tcp_context_pool;
-extern __thread void          *g_tcp_session_head;
+extern __thread memory_pool_t *g_tcp_session_pool;
+extern __thread tcp_session_t *g_tcp_session_head;
 
 extern char      g_fakedns_ipstr[IP4STRLEN];
 extern portno_t  g_fakedns_portno;

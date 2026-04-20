@@ -657,15 +657,15 @@ static void* run_event_loop(void *arg) {
         }
     }
 
-    /* 2. TCP Context Pool */
+    /* 2. TCP Session Pool */
     if (g_options & OPT_ENABLE_TCP) {
-        g_tcp_context_pool = mempool_create(
-                                 sizeof(tcp_tunnel_ctx_t),
+        g_tcp_session_pool = mempool_create(
+                                 sizeof(tcp_session_t),
                                  128,
                                  65535
                              );
-        if (!g_tcp_context_pool) {
-            LOGERR("[run_event_loop] failed to create tcp context memory pool");
+        if (!g_tcp_session_pool) {
+            LOGERR("[run_event_loop] failed to create tcp session memory pool");
             exit_code = 1;
             goto cleanup;
         }
@@ -794,12 +794,12 @@ cleanup:
         }
         g_udp_tproxy_pool = NULL;
     }
-    if (g_tcp_context_pool) {
-        size_t leaks = mempool_destroy(g_tcp_context_pool);
+    if (g_tcp_session_pool) {
+        size_t leaks = mempool_destroy(g_tcp_session_pool);
         if (leaks > 0) {
-            LOGERR("[run_event_loop] tcp context pool leaks: %zu", leaks);
+            LOGERR("[run_event_loop] tcp session pool leaks: %zu", leaks);
         }
-        g_tcp_context_pool = NULL;
+        g_tcp_session_pool = NULL;
     }
 
     if (evloop) {

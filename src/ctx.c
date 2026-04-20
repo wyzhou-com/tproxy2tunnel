@@ -32,8 +32,8 @@ __thread memory_pool_t *g_udp_session_pool               = NULL;
 __thread memory_pool_t *g_udp_main_node_pool             = NULL;
 __thread memory_pool_t *g_udp_fork_node_pool             = NULL;
 __thread memory_pool_t *g_udp_tproxy_pool                = NULL;
-__thread memory_pool_t *g_tcp_context_pool               = NULL;
-__thread void          *g_tcp_session_head               = NULL;
+__thread memory_pool_t *g_tcp_session_pool               = NULL;
+__thread tcp_session_t *g_tcp_session_head               = NULL;
 
 char      g_fakedns_ipstr[IP4STRLEN] = "127.0.0.1";
 portno_t  g_fakedns_portno           = 5353;
