@@ -55,11 +55,13 @@ extern skaddr6_t g_server_skaddr;
 extern uint8_t g_tcp_syncnt_max;
 
 extern uint16_t g_udp_idletimeout_sec;
-extern __thread udp_tunnelctx_t  *g_udp_tunnel_table;
-extern __thread udp_tunnelctx_t  *g_udp_fork_table;
-extern __thread udp_tproxyctx_t  *g_udp_tproxyctx_table;
+extern __thread udp_main_node_t  *g_udp_main_table;
+extern __thread udp_fork_node_t  *g_udp_fork_table;
+extern __thread udp_tproxy_entry_t  *g_udp_tproxy_table;
 extern __thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_BATCH_BUFSIZ];
-extern __thread memory_pool_t *g_udp_context_pool;
+extern __thread memory_pool_t *g_udp_session_pool;
+extern __thread memory_pool_t *g_udp_main_node_pool;
+extern __thread memory_pool_t *g_udp_fork_node_pool;
 extern __thread memory_pool_t *g_udp_tproxy_pool;
 extern __thread memory_pool_t *g_tcp_context_pool;
 extern __thread void          *g_tcp_session_head;

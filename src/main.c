@@ -572,16 +572,32 @@ static void* run_event_loop(void *arg) {
     int     fakedns_sockfd = -1;
 
     /* Initialize memory pools (thread-local) */
-    size_t context_max_blocks = udp_lrucache_get_main_maxsize() + udp_lrucache_get_fork_maxsize();
-    size_t context_initial_blocks = MEMPOOL_INITIAL_SIZE;
-    if (context_initial_blocks > context_max_blocks) {
-        context_initial_blocks = context_max_blocks;
+    size_t main_max_blocks = udp_lrucache_get_main_maxsize();
+    size_t fork_max_blocks = udp_lrucache_get_fork_maxsize();
+    /* LRU add inserts first, then evicts. Pools need one spare block so a full
+     * cache can allocate the incoming entry before freeing the victim. */
+    size_t session_max_blocks = main_max_blocks + fork_max_blocks + 1;
+    size_t main_node_max_blocks = main_max_blocks + 1;
+    size_t fork_node_max_blocks = fork_max_blocks + 1;
+
+    size_t session_initial_blocks = MEMPOOL_INITIAL_SIZE;
+    if (session_initial_blocks > session_max_blocks) {
+        session_initial_blocks = session_max_blocks;
+    }
+    size_t main_node_initial_blocks = MEMPOOL_INITIAL_SIZE;
+    if (main_node_initial_blocks > main_node_max_blocks) {
+        main_node_initial_blocks = main_node_max_blocks;
+    }
+    size_t fork_node_initial_blocks = MEMPOOL_INITIAL_SIZE;
+    if (fork_node_initial_blocks > fork_node_max_blocks) {
+        fork_node_initial_blocks = fork_node_max_blocks;
     }
 
     size_t tproxy_max_blocks = udp_lrucache_get_tproxy_maxsize();
+    size_t tproxy_pool_max_blocks = tproxy_max_blocks + 1;
     size_t tproxy_initial_blocks = MEMPOOL_INITIAL_SIZE;
-    if (tproxy_initial_blocks > tproxy_max_blocks) {
-        tproxy_initial_blocks = tproxy_max_blocks;
+    if (tproxy_initial_blocks > tproxy_pool_max_blocks) {
+        tproxy_initial_blocks = tproxy_pool_max_blocks;
     }
 
     int my_thread_index = is_main_thread ? 0 : thread_info->thread_index;
@@ -596,21 +612,43 @@ static void* run_event_loop(void *arg) {
 
     /* 1. UDP Context Pools */
     if (should_handle_udp) {
-        g_udp_context_pool = mempool_create(
-                                 sizeof(udp_tunnelctx_t),
-                                 context_initial_blocks,
-                                 context_max_blocks
+        g_udp_session_pool = mempool_create(
+                                 sizeof(udp_session_t),
+                                 session_initial_blocks,
+                                 session_max_blocks
                              );
-        if (!g_udp_context_pool) {
-            LOGERR("[run_event_loop] failed to create context memory pool");
+        if (!g_udp_session_pool) {
+            LOGERR("[run_event_loop] failed to create session memory pool");
+            exit_code = 1;
+            goto cleanup;
+        }
+
+        g_udp_main_node_pool = mempool_create(
+                                   sizeof(udp_main_node_t),
+                                   main_node_initial_blocks,
+                                   main_node_max_blocks
+                               );
+        if (!g_udp_main_node_pool) {
+            LOGERR("[run_event_loop] failed to create main-node memory pool");
+            exit_code = 1;
+            goto cleanup;
+        }
+
+        g_udp_fork_node_pool = mempool_create(
+                                   sizeof(udp_fork_node_t),
+                                   fork_node_initial_blocks,
+                                   fork_node_max_blocks
+                               );
+        if (!g_udp_fork_node_pool) {
+            LOGERR("[run_event_loop] failed to create fork-node memory pool");
             exit_code = 1;
             goto cleanup;
         }
 
         g_udp_tproxy_pool = mempool_create(
-                                sizeof(udp_tproxyctx_t),
+                                sizeof(udp_tproxy_entry_t),
                                 tproxy_initial_blocks,
-                                tproxy_max_blocks
+                                tproxy_pool_max_blocks
                             );
         if (!g_udp_tproxy_pool) {
             LOGERR("[run_event_loop] failed to create tproxy memory pool");
@@ -728,12 +766,26 @@ cleanup:
         tcp_proxy_close_all_sessions(evloop);
     }
 
-    if (g_udp_context_pool) {
-        size_t leaks = mempool_destroy(g_udp_context_pool);
+    if (g_udp_session_pool) {
+        size_t leaks = mempool_destroy(g_udp_session_pool);
         if (leaks > 0) {
-            LOGERR("[run_event_loop] udp context pool leaks: %zu", leaks);
+            LOGERR("[run_event_loop] udp session pool leaks: %zu", leaks);
         }
-        g_udp_context_pool = NULL;
+        g_udp_session_pool = NULL;
+    }
+    if (g_udp_main_node_pool) {
+        size_t leaks = mempool_destroy(g_udp_main_node_pool);
+        if (leaks > 0) {
+            LOGERR("[run_event_loop] udp main-node pool leaks: %zu", leaks);
+        }
+        g_udp_main_node_pool = NULL;
+    }
+    if (g_udp_fork_node_pool) {
+        size_t leaks = mempool_destroy(g_udp_fork_node_pool);
+        if (leaks > 0) {
+            LOGERR("[run_event_loop] udp fork-node pool leaks: %zu", leaks);
+        }
+        g_udp_fork_node_pool = NULL;
     }
     if (g_udp_tproxy_pool) {
         size_t leaks = mempool_destroy(g_udp_tproxy_pool);

@@ -1,13 +1,7 @@
-#include "lrucache.h"    /* LRU_DEFINE_*                                   */
-#include "udp_proxy.h"   /* udp_tunnelctx_t, udp_tproxyctx_t, ip_port_t, … */
+#include "lrucache.h"
+#include "udp_proxy.h"
 
-/* ── udp_lrucache.c ────────────────────────────────────────────────────────
- * Single instantiation point for all typed LRU cache functions.
- * ──────────────────────────────────────────────────────────────────────── */
-
-/* ════════════════════════════════════════════════════════════════════════
- * Cache Capacity Configuration & Globals
- * ════════════════════════════════════════════════════════════════════════ */
+/* Capacity configuration. */
 
 #define FORK_SIZE_MULTIPLIER   2
 #define TPROXY_SIZE_MULTIPLIER 4
@@ -36,51 +30,44 @@ void udp_lrucache_set_maxsize(uint16_t base_size) {
     g_tproxy_cache_maxsize = (tproxy_size > 65535u) ? 65535u : (uint16_t)tproxy_size;
 }
 
-/* ════════════════════════════════════════════════════════════════════════
- * Main Table  (key: client source IP:Port)
- * ════════════════════════════════════════════════════════════════════════ */
+/* Main table: client endpoint -> session. */
 
-LRU_DEFINE_ADD(udp_tunnelctx_add,
-               udp_tunnelctx_t, key_ipport,
-               udp_lrucache_get_main_maxsize(), last_active)
+LRU_DEFINE_ADD(udp_main_node_add,
+               udp_main_node_t, key,
+               g_main_cache_maxsize, last_active)
 
-LRU_DEFINE_FIND(udp_tunnelctx_find,
-                udp_tunnelctx_t, ip_port_t)
+LRU_DEFINE_FIND(udp_main_node_find,
+                udp_main_node_t, udp_endpoint_key_t)
 
-LRU_DEFINE_DEL(udp_tunnelctx_del,
-               udp_tunnelctx_t)
+LRU_DEFINE_DEL(udp_main_node_del,
+               udp_main_node_t)
 
-/* ════════════════════════════════════════════════════════════════════════
- * Fork Table  (key: composite (client, target) pair; capacity ×2)
- * ════════════════════════════════════════════════════════════════════════ */
+/* Fork table: (client endpoint, target endpoint) -> session. */
 
-LRU_DEFINE_ADD(udp_tunnelctx_fork_add,
-               udp_tunnelctx_t, fork_key,
-               udp_lrucache_get_fork_maxsize(), last_active)
+LRU_DEFINE_ADD(udp_fork_node_add,
+               udp_fork_node_t, key,
+               g_fork_cache_maxsize, last_active)
 
-LRU_DEFINE_FIND(udp_tunnelctx_fork_find,
-                udp_tunnelctx_t, udp_fork_key_t)
+LRU_DEFINE_FIND(udp_fork_node_find,
+                udp_fork_node_t, udp_fork_key_t)
 
-/* Fork Table shares udp_tunnelctx_del with Main Table */
+LRU_DEFINE_DEL(udp_fork_node_del,
+               udp_fork_node_t)
 
-/* ════════════════════════════════════════════════════════════════════════
- * TProxy Table  (key: remote source IP:Port; capacity ×4)
- * ════════════════════════════════════════════════════════════════════════ */
+/* TProxy table: remote source endpoint -> bound tproxy socket. */
 
-LRU_DEFINE_ADD(udp_tproxyctx_add,
-               udp_tproxyctx_t, key,
-               udp_lrucache_get_tproxy_maxsize(), last_active)
+LRU_DEFINE_ADD(udp_tproxy_entry_add,
+               udp_tproxy_entry_t, key,
+               g_tproxy_cache_maxsize, last_active)
 
-LRU_DEFINE_FIND(udp_tproxyctx_find,
-                udp_tproxyctx_t, udp_tproxy_key_t)
+LRU_DEFINE_FIND(udp_tproxy_entry_find,
+                udp_tproxy_entry_t, udp_tproxy_key_t)
 
-LRU_DEFINE_DEL(udp_tproxyctx_del,
-               udp_tproxyctx_t)
+LRU_DEFINE_DEL(udp_tproxy_entry_del,
+               udp_tproxy_entry_t)
 
-/* ════════════════════════════════════════════════════════════════════════
- * Clear All  (LRU_DEFINE_CLEAR)
- * ════════════════════════════════════════════════════════════════════════ */
+/* Clear helpers. */
 
-LRU_DEFINE_CLEAR(udp_tunnelctx_clear_main, udp_tunnelctx_t)
-LRU_DEFINE_CLEAR(udp_tunnelctx_clear_fork, udp_tunnelctx_t)
-LRU_DEFINE_CLEAR(udp_tproxyctx_clear,      udp_tproxyctx_t)
+LRU_DEFINE_CLEAR(udp_main_node_clear, udp_main_node_t)
+LRU_DEFINE_CLEAR(udp_fork_node_clear, udp_fork_node_t)
+LRU_DEFINE_CLEAR(udp_tproxy_entry_clear, udp_tproxy_entry_t)

@@ -1,140 +1,122 @@
 #ifndef TPROXY2TUNNEL_UDP_PROXY_H
 #define TPROXY2TUNNEL_UDP_PROXY_H
 
-/* ── udp_proxy.h ───────────────────────────────────────────────────────────
- * Tunnel-mode UDP proxy types.
- * No SOCKS5 TCP control channel — sessions are immediately usable.
- * ──────────────────────────────────────────────────────────────────────── */
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 #include "ev_types.h"
 
-#include "lrucache.h"   /* myhash_hh, MYLRU_HASH_*, LRU_DEFINE_*  */
-#include "netutils.h"   /* ip_port_t, UDP_DATAGRAM_MAXSIZ      */
+#include "lrucache.h"
+#include "netutils.h"
 
-/* ════════════════════════════════════════════════════════════════════════
- * Cache Capacity API
- * ════════════════════════════════════════════════════════════════════════ */
+/* Cache capacity API. */
 
 uint16_t udp_lrucache_get_main_maxsize(void);
 uint16_t udp_lrucache_get_fork_maxsize(void);
 uint16_t udp_lrucache_get_tproxy_maxsize(void);
 void udp_lrucache_set_maxsize(uint16_t base_size);
 
-/* ════════════════════════════════════════════════════════════════════════
- * Memory-pool / queue constants
- * ════════════════════════════════════════════════════════════════════════ */
+/* Memory-pool and batch I/O sizing. */
 
 #define MEMPOOL_INITIAL_SIZE  256
 
 #define UDP_BATCH_SIZE        16
 
-/* Maximum tunnel UDP header: ATYP(1) + LEN(1) + DOMAIN(255) + PORT(2) = 259 */
+/* ATYP(1) + LEN(1) + DOMAIN(255) + PORT(2). */
 #define MAX_TUNNEL_UDP_HEADER 259
 
-/* Batch buffer size: reserves MAX_TUNNEL_UDP_HEADER bytes in front of the
- * payload for zero-copy header prepend, so a max-size UDP datagram can be
- * fully received without MSG_TRUNC. */
+/* Reserve header space before the payload for zero-copy tunnel prepend. */
 #define UDP_BATCH_BUFSIZ     (UDP_DATAGRAM_MAXSIZ + MAX_TUNNEL_UDP_HEADER)
 
-/* ════════════════════════════════════════════════════════════════════════
- * Cache key types
- * ════════════════════════════════════════════════════════════════════════ */
-
-/*
- * udp_fork_key_t — composite key for the Fork Table.
- * Identifies a unique (client, target) pair for Symmetric NAT splitting.
+/* Cache keys.
+ *
+ * udp_endpoint_key_t is the canonical key shape for all UDP caches. It is
+ * hashed by value, so constructors must zero-initialize it before filling.
  */
+
 typedef struct {
-    ip_port_t client_ipport;
-    bool      target_is_ipv4;   /* protocol-family flag for target */
-    ip_port_t target_ipport;    /* full address for Symmetric NAT  */
+    uint16_t family;   /* AF_INET / AF_INET6 */
+    portno_t port;     /* network byte order */
+    uint8_t  addr[16]; /* v4 uses the first 4 bytes */
+} udp_endpoint_key_t;
+
+_Static_assert(sizeof(udp_endpoint_key_t) == 20,
+               "udp_endpoint_key_t must be 20B with zero padding for memcmp hashing");
+
+typedef struct {
+    udp_endpoint_key_t client;
+    udp_endpoint_key_t target;
 } udp_fork_key_t;
 
-/*
- * udp_tproxy_key_t — TProxy Table key.
- * Disambiguates IPv4/IPv6 remote source addresses so that a v4 address
- * whose bytes happen to match the low bytes of a v6 address cannot share
- * a cache entry (the two bind to different sockets).
- */
-typedef struct {
-    bool      target_is_ipv4;
-    ip_port_t ipport;
-} udp_tproxy_key_t;
+typedef udp_endpoint_key_t udp_tproxy_key_t;
 
-/* ════════════════════════════════════════════════════════════════════════
- * udp_tunnelctx_t — session context for the Main Table and Fork Table
+/* Sessions and cache index nodes.
  *
- * Tunnel mode: no TCP control channel, no handshake, no pending queue.
- * Session is immediately usable after UDP socket creation.
- * ════════════════════════════════════════════════════════════════════════ */
+ * A session owns the connected tunnel UDP socket. It is indexed by exactly one
+ * table at a time: main_idx XOR fork_idx.
+ */
+
+typedef struct udp_main_node udp_main_node_t;
+typedef struct udp_fork_node udp_fork_node_t;
+
+typedef struct udp_session {
+    /* Must stay at offset 0: udp_tunnel_recv_cb recovers the session via offsetof. */
+    evio_t             udp_watcher;
+
+    udp_endpoint_key_t client;       /* reply destination */
+    udp_endpoint_key_t orig_dst;     /* original destination */
+
+    bool               is_fakedns;
+
+    udp_main_node_t   *main_idx;
+    udp_fork_node_t   *fork_idx;
+} udp_session_t;
+
+struct udp_main_node {
+    udp_endpoint_key_t key;
+    udp_session_t     *session;
+    ev_tstamp          last_active;
+    myhash_hh          hh;
+};
+
+struct udp_fork_node {
+    udp_fork_key_t     key;
+    udp_session_t     *session;
+    ev_tstamp          last_active;
+    myhash_hh          hh;
+};
 
 typedef struct {
-    /* ── cache keys ────────────────────────────────── */
-    ip_port_t      key_ipport;   /* Main Table key: client source IP:Port  */
-    udp_fork_key_t fork_key;     /* Fork Table key: (client, target) pair  */
+    udp_tproxy_key_t key;
+    int              udp_sockfd;
+    ev_tstamp        last_active;
 
-    /* ── session metadata ──────────────────────────── */
-    ip_port_t      orig_dstaddr; /* original destination (FakeIP or real)  */
-    bool           dest_is_ipv4; /* protocol-family flag for orig_dstaddr  */
-    bool           is_forked;    /* true => entry lives in Fork Table      */
-    bool           is_fakedns;   /* true => FakeDNS session                */
+    myhash_hh        hh;
+} udp_tproxy_entry_t;
 
-    /* ── libev watcher ─────────────────────────────── */
-    evio_t    udp_watcher;  /* connected UDP socket to tunnel server      */
+/* LRU cache functions generated in udp_lrucache.c. */
 
-    /* ── GC timestamp ──────────────────────────────── */
-    ev_tstamp last_active;
+udp_main_node_t* udp_main_node_add(udp_main_node_t **cache, udp_main_node_t *entry);
+udp_fork_node_t* udp_fork_node_add(udp_fork_node_t **cache, udp_fork_node_t *entry);
+udp_tproxy_entry_t* udp_tproxy_entry_add(udp_tproxy_entry_t **cache, udp_tproxy_entry_t *entry);
 
-    /* ── uthash bookkeeping (must be last) ─────────── */
-    myhash_hh hh;
-} udp_tunnelctx_t;
+udp_main_node_t* udp_main_node_find(udp_main_node_t **cache, const udp_endpoint_key_t *keyptr);
+udp_fork_node_t* udp_fork_node_find(udp_fork_node_t **cache, const udp_fork_key_t     *keyptr);
+udp_tproxy_entry_t* udp_tproxy_entry_find(udp_tproxy_entry_t **cache, const udp_tproxy_key_t   *keyptr);
 
-/* ════════════════════════════════════════════════════════════════════════
- * udp_tproxyctx_t  — per-source-socket context for the TProxy Table
- * ════════════════════════════════════════════════════════════════════════ */
+void udp_main_node_del(udp_main_node_t **cache, udp_main_node_t *entry);
+void udp_fork_node_del(udp_fork_node_t **cache, udp_fork_node_t *entry);
+void udp_tproxy_entry_del(udp_tproxy_entry_t **cache, udp_tproxy_entry_t *entry);
 
-typedef struct {
-    udp_tproxy_key_t key;   /* address-family + (remote) source socket address */
-    int       udp_sockfd;   /* bound to the above address      */
-    ev_tstamp last_active;  /* GC timestamp */
+typedef void (*udp_main_node_cb_t)(void *ctx, udp_main_node_t *entry);
+typedef void (*udp_fork_node_cb_t)(void *ctx, udp_fork_node_t *entry);
+typedef void (*udp_tproxy_entry_cb_t)(void *ctx, udp_tproxy_entry_t *entry);
 
-    myhash_hh hh;           /* uthash bookkeeping              */
-} udp_tproxyctx_t;
-
-/* ════════════════════════════════════════════════════════════════════════
- * LRU cache function declarations
- * (bodies generated by LRU_DEFINE_* in udp_lrucache.c)
- * ════════════════════════════════════════════════════════════════════════ */
-
-/* add — returns the evicted entry when over capacity, else NULL. */
-udp_tunnelctx_t* udp_tunnelctx_add(udp_tunnelctx_t **cache, udp_tunnelctx_t *entry);
-udp_tunnelctx_t* udp_tunnelctx_fork_add(udp_tunnelctx_t **cache, udp_tunnelctx_t *entry);
-udp_tproxyctx_t* udp_tproxyctx_add(udp_tproxyctx_t **cache, udp_tproxyctx_t *entry);
-
-/* find — pure lookup; returns NULL on miss */
-udp_tunnelctx_t* udp_tunnelctx_find(udp_tunnelctx_t **cache, const ip_port_t        *keyptr);
-udp_tunnelctx_t* udp_tunnelctx_fork_find(udp_tunnelctx_t **cache, const udp_fork_key_t   *keyptr);
-udp_tproxyctx_t* udp_tproxyctx_find(udp_tproxyctx_t **cache, const udp_tproxy_key_t *keyptr);
-
-/* del — unconditional removal */
-void udp_tunnelctx_del(udp_tunnelctx_t **cache, udp_tunnelctx_t *entry);
-void udp_tproxyctx_del(udp_tproxyctx_t **cache, udp_tproxyctx_t *entry);
-
-/* clear — iterate and invoke callback, safe for removal */
-typedef void (*udp_tunnelctx_cb_t)(void *ctx, udp_tunnelctx_t *entry);
-typedef void (*udp_tproxyctx_cb_t)(void *ctx, udp_tproxyctx_t *entry);
-
-void udp_tunnelctx_clear_main(udp_tunnelctx_t **cache, udp_tunnelctx_cb_t cb, void *ctx);
-void udp_tunnelctx_clear_fork(udp_tunnelctx_t **cache, udp_tunnelctx_cb_t cb, void *ctx);
-void udp_tproxyctx_clear(udp_tproxyctx_t **cache, udp_tproxyctx_cb_t cb, void *ctx);
-
-/* ════════════════════════════════════════════════════════════════════════
- * Event callbacks
- * ════════════════════════════════════════════════════════════════════════ */
+void udp_main_node_clear(udp_main_node_t **cache, udp_main_node_cb_t cb, void *ctx);
+void udp_fork_node_clear(udp_fork_node_t **cache, udp_fork_node_cb_t cb, void *ctx);
+void udp_tproxy_entry_clear(udp_tproxy_entry_t **cache, udp_tproxy_entry_cb_t cb, void *ctx);
 
 void udp_tproxy_recvmsg_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents);
 void udp_proxy_thread_init(void);

@@ -24,11 +24,13 @@ skaddr6_t g_server_skaddr           = {0};
 uint8_t g_tcp_syncnt_max = 0; /* 0: use default syncnt */
 
 uint16_t g_udp_idletimeout_sec                           = 60;
-__thread udp_tunnelctx_t  *g_udp_tunnel_table            = NULL;
-__thread udp_tunnelctx_t  *g_udp_fork_table              = NULL;
-__thread udp_tproxyctx_t  *g_udp_tproxyctx_table         = NULL;
+__thread udp_main_node_t  *g_udp_main_table              = NULL;
+__thread udp_fork_node_t  *g_udp_fork_table              = NULL;
+__thread udp_tproxy_entry_t  *g_udp_tproxy_table         = NULL;
 __thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_BATCH_BUFSIZ];
-__thread memory_pool_t *g_udp_context_pool               = NULL;
+__thread memory_pool_t *g_udp_session_pool               = NULL;
+__thread memory_pool_t *g_udp_main_node_pool             = NULL;
+__thread memory_pool_t *g_udp_fork_node_pool             = NULL;
 __thread memory_pool_t *g_udp_tproxy_pool                = NULL;
 __thread memory_pool_t *g_tcp_context_pool               = NULL;
 __thread void          *g_tcp_session_head               = NULL;
