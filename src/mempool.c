@@ -146,7 +146,20 @@ memory_pool_t* mempool_create(size_t block_size, size_t initial_blocks, size_t m
     pool->max_blocks = (max_blocks == 0) ? SIZE_MAX : max_blocks;
 
     if (initial_blocks > 0) {
-        expand_pool_batch(pool, MIN(initial_blocks, pool->max_blocks));
+        size_t want = MIN(initial_blocks, pool->max_blocks);
+        size_t got  = expand_pool_batch(pool, want);
+        if (got < want) {
+            LOGERR("[mempool] create: initial reservation failed (requested=%zu, got=%zu)",
+                   want, got);
+            mempool_slab_t *s = pool->slab_list;
+            while (s) {
+                mempool_slab_t *n = s->next;
+                free(s);
+                s = n;
+            }
+            free(pool);
+            return NULL;
+        }
     }
 
     size_t phys_mem_kb = mempool_physical_size(pool) / 1024;
@@ -200,11 +213,15 @@ static inline bool verify_boundary(memory_pool_t *pool, mempool_slab_t *slab, ch
     if (!slab) {
         return false;
     }
-    char *slab_start = (char *)slab + sizeof(mempool_slab_t);
-    char *slab_end   = slab_start + slab->block_count * pool->total_size;
+    /* Use uintptr_t arithmetic: relational comparison / subtraction between
+     * pointers from different objects is UB in C, and this path is designed
+     * to reject arbitrary foreign pointers. */
+    uintptr_t addr       = (uintptr_t)hdr_ptr;
+    uintptr_t slab_start = (uintptr_t)slab + sizeof(mempool_slab_t);
+    uintptr_t slab_end   = slab_start + slab->block_count * pool->total_size;
 
-    if (hdr_ptr >= slab_start && hdr_ptr < slab_end) {
-        return ((size_t)(hdr_ptr - slab_start) % pool->total_size == 0);
+    if (addr >= slab_start && addr < slab_end) {
+        return ((addr - slab_start) % pool->total_size == 0);
     }
     return false;
 }
