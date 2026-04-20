@@ -23,6 +23,10 @@
 
 static void* run_event_loop(void *arg);
 static void on_async_exit(evloop_t *loop, struct ev_watcher *watcher __attribute__((unused)), int revents __attribute__((unused)));
+static void request_worker_exits(void);
+static int join_worker_threads(void);
+
+static pthread_mutex_t g_thread_state_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void print_command_help(void) {
     printf("usage: tproxy2tunnel <options...>. the existing options are as follows:\n"
@@ -419,9 +423,11 @@ int main(int argc, char* argv[]) {
     LOGINF("[main] verbose mode (affect performance)");
 
     int started_threads = 0;
+    int exit_code = 0;
     g_thread_count = g_nthreads - 1;
     for (int i = 0; i < g_thread_count; ++i) {
         g_threads[i].thread_index = i + 1;
+        g_threads[i].running = 0;
         g_threads[i].evloop = ev_loop_new(0);
         if (!g_threads[i].evloop) {
             LOGERR("[main] ev_loop_new failed for thread %d", i);
@@ -430,9 +436,15 @@ int main(int argc, char* argv[]) {
         ev_async_init(&g_threads[i].exit_watcher, on_async_exit);
         ev_async_start(g_threads[i].evloop, &g_threads[i].exit_watcher);
 
+        pthread_mutex_lock(&g_thread_state_lock);
+        g_threads[i].running = 1;
+        pthread_mutex_unlock(&g_thread_state_lock);
         int ret = pthread_create(&g_threads[i].thread_id, NULL, run_event_loop, &g_threads[i]);
         if (ret != 0) {
             LOGERR("[main] create worker thread: %s", strerror(ret));
+            pthread_mutex_lock(&g_thread_state_lock);
+            g_threads[i].running = 0;
+            pthread_mutex_unlock(&g_thread_state_lock);
             ev_async_stop(g_threads[i].evloop, &g_threads[i].exit_watcher);
             ev_loop_destroy(g_threads[i].evloop);
             g_threads[i].evloop = NULL;
@@ -444,28 +456,30 @@ int main(int argc, char* argv[]) {
 
 THREAD_INIT_FAIL:
     g_thread_count = started_threads;
-    for (int j = 0; j < g_thread_count; j++) {
-        ev_async_send(g_threads[j].evloop, &g_threads[j].exit_watcher);
-    }
-    for (int j = 0; j < g_thread_count; j++) {
-        pthread_join(g_threads[j].thread_id, NULL);
-    }
-    return 1;
+    request_worker_exits();
+    (void)join_worker_threads();
+    exit_code = 1;
+    goto MAIN_EXIT;
 
 THREAD_INIT_OK:
-    run_event_loop(NULL);  /* main thread passes NULL */
+    exit_code = (int)(intptr_t)run_event_loop(NULL);  /* main thread passes NULL */
+    if (exit_code != 0) {
+        request_worker_exits();
+    }
 
-    for (int i = 0; i < g_thread_count; ++i) {
-        pthread_join(g_threads[i].thread_id, NULL);
+    int worker_exit_code = join_worker_threads();
+    if (exit_code == 0 && worker_exit_code != 0) {
+        exit_code = worker_exit_code;
     }
     LOG_ALWAYS_INF("[main] all worker threads exited");
 
+MAIN_EXIT:
     LOG_ALWAYS_INF("[main] exiting...");
     if ((g_options & OPT_ENABLE_FAKEDNS) && g_fakedns_cache_path[0]) {
         fakedns_save(g_fakedns_cache_path);
     }
 
-    return 0;
+    return exit_code;
 }
 
 static void on_signal_read(evloop_t *loop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
@@ -478,17 +492,43 @@ static void on_signal_read(evloop_t *loop, struct ev_watcher *watcher, int reven
 
     LOG_ALWAYS_INF("[on_signal_read] caught signal %d, stopping...", fdsi.ssi_signo);
 
-    for (int i = 0; i < g_thread_count; i++) {
-        if (g_threads[i].evloop) {
-            ev_async_send(g_threads[i].evloop, &g_threads[i].exit_watcher);
-        }
-    }
-
+    request_worker_exits();
     ev_break(loop, EVBREAK_ALL);
 }
 
 static void on_async_exit(evloop_t *loop, struct ev_watcher *watcher __attribute__((unused)), int revents __attribute__((unused))) {
     ev_break(loop, EVBREAK_ALL);
+}
+
+static void request_worker_exits(void) {
+    pthread_mutex_lock(&g_thread_state_lock);
+    for (int i = 0; i < g_thread_count; i++) {
+        if (g_threads[i].running && g_threads[i].evloop) {
+            ev_async_send(g_threads[i].evloop, &g_threads[i].exit_watcher);
+        }
+    }
+    pthread_mutex_unlock(&g_thread_state_lock);
+}
+
+static int join_worker_threads(void) {
+    int exit_code = 0;
+    for (int i = 0; i < g_thread_count; ++i) {
+        void *thread_ret = NULL;
+        int ret = pthread_join(g_threads[i].thread_id, &thread_ret);
+        if (ret != 0) {
+            LOGERR("[main] join worker thread %d: %s", i + 1, strerror(ret));
+            if (exit_code == 0) exit_code = ret;
+        } else if (thread_ret && exit_code == 0) {
+            exit_code = (int)(intptr_t)thread_ret;
+        }
+
+        if (g_threads[i].evloop) {
+            ev_loop_destroy(g_threads[i].evloop);
+            g_threads[i].evloop = NULL;
+        }
+        g_threads[i].running = 0;
+    }
+    return exit_code;
 }
 
 /* Listen endpoint descriptor for unified socket setup/cleanup */
@@ -618,7 +658,7 @@ static void* run_event_loop(void *arg) {
                                  session_max_blocks
                              );
         if (!g_udp_session_pool) {
-            LOGERR("[run_event_loop] failed to create session memory pool");
+            LOGERR("[run_event_loop] failed to create udp session memory pool");
             exit_code = 1;
             goto cleanup;
         }
@@ -629,7 +669,7 @@ static void* run_event_loop(void *arg) {
                                    main_node_max_blocks
                                );
         if (!g_udp_main_node_pool) {
-            LOGERR("[run_event_loop] failed to create main-node memory pool");
+            LOGERR("[run_event_loop] failed to create udp main-node memory pool");
             exit_code = 1;
             goto cleanup;
         }
@@ -640,7 +680,7 @@ static void* run_event_loop(void *arg) {
                                    fork_node_max_blocks
                                );
         if (!g_udp_fork_node_pool) {
-            LOGERR("[run_event_loop] failed to create fork-node memory pool");
+            LOGERR("[run_event_loop] failed to create udp fork-node memory pool");
             exit_code = 1;
             goto cleanup;
         }
@@ -651,7 +691,7 @@ static void* run_event_loop(void *arg) {
                                 tproxy_pool_max_blocks
                             );
         if (!g_udp_tproxy_pool) {
-            LOGERR("[run_event_loop] failed to create tproxy memory pool");
+            LOGERR("[run_event_loop] failed to create udp tproxy memory pool");
             exit_code = 1;
             goto cleanup;
         }
@@ -691,10 +731,10 @@ static void* run_event_loop(void *arg) {
     enum { EP_TCP4 = 0, EP_TCP6, EP_UDP4, EP_UDP6, EP_COUNT };
 
     listen_endpoint_t endpoints[EP_COUNT] = {
-        [EP_TCP4] = { &sockfds[0], &watchers[0], AF_INET,  true,  &g_tcp_bind_skaddr4, sizeof(skaddr4_t), tcp_tproxy_accept_cb,  "tcp4" },
-        [EP_TCP6] = { &sockfds[1], &watchers[1], AF_INET6, true,  &g_tcp_bind_skaddr6, sizeof(skaddr6_t), tcp_tproxy_accept_cb,  "tcp6" },
-        [EP_UDP4] = { &sockfds[2], &watchers[2], AF_INET,  false, &g_bind_skaddr4,     sizeof(skaddr4_t), udp_tproxy_recvmsg_cb, "udp4" },
-        [EP_UDP6] = { &sockfds[3], &watchers[3], AF_INET6, false, &g_bind_skaddr6,     sizeof(skaddr6_t), udp_tproxy_recvmsg_cb, "udp6" },
+        [EP_TCP4] = { &sockfds[0], &watchers[0], AF_INET,  true,  &g_tcp_bind_skaddr4, sizeof(skaddr4_t), tcp_proxy_on_accept,  "tcp4" },
+        [EP_TCP6] = { &sockfds[1], &watchers[1], AF_INET6, true,  &g_tcp_bind_skaddr6, sizeof(skaddr6_t), tcp_proxy_on_accept,  "tcp6" },
+        [EP_UDP4] = { &sockfds[2], &watchers[2], AF_INET,  false, &g_bind_skaddr4,     sizeof(skaddr4_t), udp_proxy_on_recvmsg, "udp4" },
+        [EP_UDP6] = { &sockfds[3], &watchers[3], AF_INET6, false, &g_bind_skaddr6,     sizeof(skaddr6_t), udp_proxy_on_recvmsg, "udp6" },
     };
 
     bool ep_enabled[EP_COUNT] = {
@@ -739,7 +779,7 @@ static void* run_event_loop(void *arg) {
 
     if (should_handle_udp) {
         udp_proxy_thread_init();
-        udp_proxy_init_gc(evloop);
+        udp_proxy_gc_start(evloop);
     }
 
     ev_run(evloop, 0);
@@ -802,20 +842,21 @@ cleanup:
         g_tcp_session_pool = NULL;
     }
 
-    if (evloop) {
+    if (evloop && is_main_thread) {
         ev_loop_destroy(evloop);
-        if (!is_main_thread) {
-            thread_info->evloop = NULL;
-        }
+    }
+
+    if (!is_main_thread) {
+        pthread_mutex_lock(&g_thread_state_lock);
+        thread_info->running = 0;
+        pthread_mutex_unlock(&g_thread_state_lock);
     }
 
     if (exit_code != 0) {
-        if (is_main_thread) {
-            exit(exit_code);
-        } else {
+        if (!is_main_thread) {
             LOGERR("[run_event_loop] worker thread failed (code=%d), requesting shutdown", exit_code);
             kill(getpid(), SIGTERM);
         }
     }
-    return NULL;
+    return (void *)(intptr_t)exit_code;
 }

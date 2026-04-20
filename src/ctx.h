@@ -19,6 +19,7 @@ typedef struct {
     evloop_t *evloop;
     ev_async exit_watcher;
     int thread_index;       /* thread index: main=0, workers=1..N-1 */
+    int running;
 } thread_info_t;
 
 /* Global thread management */
