@@ -1,5 +1,5 @@
-#ifndef IPT2SOCKS_LRUCACHE_H
-#define IPT2SOCKS_LRUCACHE_H
+#ifndef TPROXY2TUNNEL_LRUCACHE_H
+#define TPROXY2TUNNEL_LRUCACHE_H
 
 /* ── lrucache.h ────────────────────────────────────────────────────────────
  * Generic LRU-eviction layer.
@@ -119,4 +119,4 @@ void func_name(type **cache, void (*cb)(void *, type *), void *ctx) {        \
     }                                                                        \
 }
 
-#endif /* IPT2SOCKS_LRUCACHE_H */
+#endif /* TPROXY2TUNNEL_LRUCACHE_H */

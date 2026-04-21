@@ -41,13 +41,10 @@ static void print_command_help(void) {
            " -j, --thread-nums <num>            number of the worker threads, default: 1\n"
            " -J, --udp-thread-nums <num>        number of udp threads, default: 1\n"
            " -n, --nofile-limit <num>           set nofile limit, may need root privilege\n"
-           " -u, --run-user <user>              run as the given user, need root privilege\n"
            " -T, --tcp-only                     listen tcp only, aka: disable udp proxy\n"
            " -U, --udp-only                     listen udp only, aka: disable tcp proxy\n"
            " -4, --ipv4-only                    listen ipv4 only, aka: disable ipv6 proxy\n"
            " -6, --ipv6-only                    listen ipv6 only, aka: disable ipv4 proxy\n"
-           " -R, --redirect                     use redirect instead of tproxy for tcp\n"
-           " -r, --reuse-port                   enable so_reuseport for single thread\n"
            " -w, --tfo-accept                   enable tcp_fastopen for server socket\n"
            " -W, --tfo-connect                  enable tcp_fastopen for client socket\n"
            " -v, --verbose                      print verbose log, affect performance\n"
@@ -102,15 +99,9 @@ static bool validate_uint_range(const char *valstr, unsigned long max_val, unsig
     return true;
 }
 
-typedef struct {
-    const char   *run_user;               /* NULL if --run-user not set */
-    unsigned long nofile_limit;
-    bool          set_nofile_limit_enabled;
-} startup_config_t;
-
-static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
+static unsigned long parse_command_args(int argc, char* argv[]) {
     opterr = 0;
-    const char *optstr = ":s:p:b:B:l:S:c:o:j:J:n:u:TU46RrwWvVh";
+    const char *optstr = ":s:p:b:B:l:S:c:o:j:J:n:TU46wWvVh";
     const struct option options[] = {
         {"server-addr",   required_argument, NULL, 's'},
         {"server-port",   required_argument, NULL, 'p'},
@@ -123,13 +114,10 @@ static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
         {"thread-nums",   required_argument, NULL, 'j'},
         {"udp-thread-nums", required_argument, NULL, 'J'},
         {"nofile-limit",  required_argument, NULL, 'n'},
-        {"run-user",      required_argument, NULL, 'u'},
         {"tcp-only",      no_argument,       NULL, 'T'},
         {"udp-only",      no_argument,       NULL, 'U'},
         {"ipv4-only",     no_argument,       NULL, '4'},
         {"ipv6-only",     no_argument,       NULL, '6'},
-        {"redirect",      no_argument,       NULL, 'R'},
-        {"reuse-port",    no_argument,       NULL, 'r'},
         {"tfo-accept",    no_argument,       NULL, 'w'},
         {"tfo-connect",   no_argument,       NULL, 'W'},
         {"verbose",       no_argument,       NULL, 'v'},
@@ -144,6 +132,7 @@ static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
     };
 
     int shortopt = -1;
+    unsigned long nofile_limit = 0;
     while ((shortopt = getopt_long(argc, argv, optstr, options, NULL)) != -1) {
         switch (shortopt) {
             case 's':
@@ -219,13 +208,9 @@ static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
                     if (!validate_uint_range(optarg, ULONG_MAX, &val, "nofile limit")) {
                         goto PRINT_HELP_AND_EXIT;
                     }
-                    cfg->nofile_limit = val;
-                    cfg->set_nofile_limit_enabled = true;
+                    nofile_limit = val;
                     break;
                 }
-            case 'u':
-                cfg->run_user = optarg;
-                break;
             case 'T':
                 g_options &= (uint16_t)~OPT_ENABLE_UDP;
                 break;
@@ -237,12 +222,6 @@ static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
                 break;
             case '6':
                 g_options &= (uint16_t)~OPT_ENABLE_IPV4;
-                break;
-            case 'R':
-                g_options |= OPT_TCP_USE_REDIRECT;
-                break;
-            case 'r':
-                g_options |= OPT_ALWAYS_REUSE_PORT;
                 break;
             case 'w':
                 g_options |= OPT_ENABLE_TFO_ACCEPT;
@@ -312,7 +291,7 @@ static void parse_command_args(int argc, char* argv[], startup_config_t *cfg) {
     if (g_udp_nthreads > g_nthreads) {
         g_udp_nthreads = g_nthreads;
     }
-    return;
+    return nofile_limit;
 
 PRINT_HELP_AND_EXIT:
     print_command_help();
@@ -330,55 +309,25 @@ int main(int argc, char* argv[]) {
 
     setvbuf(stdout, NULL, _IOLBF, 256);
 
-    startup_config_t cfg = {0};
-    parse_command_args(argc, argv, &cfg);
+    unsigned long nofile_limit = parse_command_args(argc, argv);
 
-    /* 1. Apply RLIMIT_NOFILE (may need root). */
-    if (cfg.set_nofile_limit_enabled) {
-        set_nofile_limit(cfg.nofile_limit);
+    if (nofile_limit) {
+        set_nofile_limit(nofile_limit);
     }
 
-    /* 2. Build socket addresses. UDP uses user-specified bind addr; TCP uses
-     *    wildcard in redirect mode (packets arrive rewritten to local addr)
-     *    and the same bind addr as UDP in tproxy mode. */
     build_socket_addr(AF_INET,  &g_bind_skaddr4, g_bind_ipstr4, g_bind_portno);
     build_socket_addr(AF_INET6, &g_bind_skaddr6, g_bind_ipstr6, g_bind_portno);
-    if (g_options & OPT_TCP_USE_REDIRECT) {
-        build_socket_addr(AF_INET,  &g_tcp_bind_skaddr4, IP4STR_WILDCARD, g_bind_portno);
-        build_socket_addr(AF_INET6, &g_tcp_bind_skaddr6, IP6STR_WILDCARD, g_bind_portno);
-    } else {
-        g_tcp_bind_skaddr4 = g_bind_skaddr4;
-        g_tcp_bind_skaddr6 = g_bind_skaddr6;
-    }
     build_socket_addr(get_ipstr_family(g_server_ipstr), &g_server_skaddr, g_server_ipstr, g_server_portno);
     if (g_options & OPT_ENABLE_FAKEDNS) {
         build_socket_addr(AF_INET, &g_fakedns_skaddr, g_fakedns_ipstr, g_fakedns_portno);
     }
 
-    /* 3. Drop privileges last (after nofile limit + address build). */
-    if (cfg.run_user) {
-        if (!run_as_user(cfg.run_user, argv)) {
-            LOGERR("[main] failed to run as user '%s', exiting", cfg.run_user);
-            return 1;
-        }
-    }
-
     LOG_ALWAYS_INF("[main] tunnel server address: %s#%hu", g_server_ipstr, g_server_portno);
     if (g_options & OPT_ENABLE_IPV4) {
-        if (g_options & OPT_TCP_USE_REDIRECT) {
-            LOG_ALWAYS_INF("[main] listen address: udp=%s#%hu tcp=%s#%hu",
-                           g_bind_ipstr4, g_bind_portno, IP4STR_WILDCARD, g_bind_portno);
-        } else {
-            LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr4, g_bind_portno);
-        }
+        LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr4, g_bind_portno);
     }
     if (g_options & OPT_ENABLE_IPV6) {
-        if (g_options & OPT_TCP_USE_REDIRECT) {
-            LOG_ALWAYS_INF("[main] listen address: udp=%s#%hu tcp=%s#%hu",
-                           g_bind_ipstr6, g_bind_portno, IP6STR_WILDCARD, g_bind_portno);
-        } else {
-            LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr6, g_bind_portno);
-        }
+        LOG_ALWAYS_INF("[main] listen address: %s#%hu", g_bind_ipstr6, g_bind_portno);
     }
     if (g_tcp_syncnt_max) {
         LOG_ALWAYS_INF("[main] max number of syn retries: %hhu", g_tcp_syncnt_max);
@@ -398,12 +347,6 @@ int main(int argc, char* argv[]) {
     }
     if (g_options & OPT_ENABLE_UDP) {
         LOG_ALWAYS_INF("[main] enable udp transparent proxy (tunnel mode)");
-    }
-    if (g_options & OPT_TCP_USE_REDIRECT) {
-        LOG_ALWAYS_INF("[main] use redirect instead of tproxy");
-    }
-    if (g_options & OPT_ALWAYS_REUSE_PORT) {
-        LOG_ALWAYS_INF("[main] always enable reuseport feature");
     }
     if (g_options & OPT_ENABLE_TFO_ACCEPT) {
         LOG_ALWAYS_INF("[main] enable tfo for tcp server socket");
@@ -544,10 +487,10 @@ typedef struct {
 } listen_endpoint_t;
 
 static int setup_listen_endpoint(evloop_t *evloop, const listen_endpoint_t *ep,
-                                 bool is_tproxy, bool is_reuse_port, bool is_tfo_accept) {
+                                 bool is_reuse_port, bool is_tfo_accept) {
     int sockfd;
     if (ep->is_tcp) {
-        sockfd = new_tcp_listen_sockfd(ep->family, is_tproxy, is_reuse_port, is_tfo_accept);
+        sockfd = new_tcp_listen_sockfd(ep->family, is_reuse_port, is_tfo_accept);
     } else {
         sockfd = new_udp_tprecv_sockfd(ep->family, is_reuse_port);
     }
@@ -634,7 +577,7 @@ static void* run_event_loop(void *arg) {
     }
 
     size_t tproxy_max_blocks = udp_lrucache_get_tproxy_maxsize();
-    size_t tproxy_pool_max_blocks = tproxy_max_blocks + 1;
+    size_t tproxy_pool_max_blocks = tproxy_max_blocks + UDP_BATCH_SIZE;
     size_t tproxy_initial_blocks = MEMPOOL_INITIAL_SIZE;
     if (tproxy_initial_blocks > tproxy_pool_max_blocks) {
         tproxy_initial_blocks = tproxy_pool_max_blocks;
@@ -731,10 +674,10 @@ static void* run_event_loop(void *arg) {
     enum { EP_TCP4 = 0, EP_TCP6, EP_UDP4, EP_UDP6, EP_COUNT };
 
     listen_endpoint_t endpoints[EP_COUNT] = {
-        [EP_TCP4] = { &sockfds[0], &watchers[0], AF_INET,  true,  &g_tcp_bind_skaddr4, sizeof(skaddr4_t), tcp_proxy_on_accept,  "tcp4" },
-        [EP_TCP6] = { &sockfds[1], &watchers[1], AF_INET6, true,  &g_tcp_bind_skaddr6, sizeof(skaddr6_t), tcp_proxy_on_accept,  "tcp6" },
-        [EP_UDP4] = { &sockfds[2], &watchers[2], AF_INET,  false, &g_bind_skaddr4,     sizeof(skaddr4_t), udp_proxy_on_recvmsg, "udp4" },
-        [EP_UDP6] = { &sockfds[3], &watchers[3], AF_INET6, false, &g_bind_skaddr6,     sizeof(skaddr6_t), udp_proxy_on_recvmsg, "udp6" },
+        [EP_TCP4] = { &sockfds[0], &watchers[0], AF_INET,  true,  &g_bind_skaddr4, sizeof(skaddr4_t), tcp_proxy_on_accept,  "tcp4" },
+        [EP_TCP6] = { &sockfds[1], &watchers[1], AF_INET6, true,  &g_bind_skaddr6, sizeof(skaddr6_t), tcp_proxy_on_accept,  "tcp6" },
+        [EP_UDP4] = { &sockfds[2], &watchers[2], AF_INET,  false, &g_bind_skaddr4, sizeof(skaddr4_t), udp_proxy_on_recvmsg, "udp4" },
+        [EP_UDP6] = { &sockfds[3], &watchers[3], AF_INET6, false, &g_bind_skaddr6, sizeof(skaddr6_t), udp_proxy_on_recvmsg, "udp6" },
     };
 
     bool ep_enabled[EP_COUNT] = {
@@ -744,15 +687,14 @@ static void* run_event_loop(void *arg) {
         [EP_UDP6] = should_handle_udp && (g_options & OPT_ENABLE_IPV6),
     };
 
-    bool is_tproxy = !(g_options & OPT_TCP_USE_REDIRECT);
     bool is_tfo_accept = g_options & OPT_ENABLE_TFO_ACCEPT;
-    bool is_tcp_reuse_port = g_nthreads > 1 || (g_options & OPT_ALWAYS_REUSE_PORT);
-    bool is_udp_reuse_port = g_udp_nthreads > 1 || (g_options & OPT_ALWAYS_REUSE_PORT);
+    bool is_tcp_reuse_port = g_nthreads > 1;
+    bool is_udp_reuse_port = g_udp_nthreads > 1;
 
     for (int i = 0; i < EP_COUNT; i++) {
         if (!ep_enabled[i]) continue;
         bool reuse = endpoints[i].is_tcp ? is_tcp_reuse_port : is_udp_reuse_port;
-        exit_code = setup_listen_endpoint(evloop, &endpoints[i], is_tproxy, reuse, is_tfo_accept);
+        exit_code = setup_listen_endpoint(evloop, &endpoints[i], reuse, is_tfo_accept);
         if (exit_code) goto cleanup;
     }
 

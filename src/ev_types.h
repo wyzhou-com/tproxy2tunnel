@@ -4,8 +4,8 @@
  * It pre-defines macros that ev.h honors via #ifndef guards, ensuring
  * all watcher structs use a uniform callback signature and layout.
  */
-#ifndef IPT2SOCKS_EV_TYPES_H
-#define IPT2SOCKS_EV_TYPES_H
+#ifndef TPROXY2TUNNEL_EV_TYPES_H
+#define TPROXY2TUNNEL_EV_TYPES_H
 
 /* Forward declarations required by EV_CB_DECLARE below */
 struct ev_loop;
@@ -22,7 +22,7 @@ struct ev_watcher;
  */
 #ifndef EV_CB_DECLARE
 #   define EV_CB_DECLARE(type) void (*cb)(struct ev_loop *loop, struct ev_watcher *w, int revents);
-#endif
+#endif /* EV_CB_DECLARE */
 
 /*
  * Collapse the priority range to a single level (0).
@@ -35,10 +35,10 @@ struct ev_watcher;
  */
 #ifndef EV_MINPRI
 #define EV_MINPRI 0
-#endif
+#endif /* EV_MINPRI */
 #ifndef EV_MAXPRI
 #define EV_MAXPRI 0
-#endif
+#endif /* EV_MAXPRI */
 
 #include "../libev/ev.h"
 
@@ -51,7 +51,7 @@ struct ev_watcher;
 # define ev_set_priority(ev,pri) ((void)(ev), (void)(pri))
 # undef ev_priority
 # define ev_priority(ev)         ((void)(ev), EV_MINPRI)
-#endif
+#endif /* EV_MINPRI == EV_MAXPRI */
 
 /* --- Application-layer type aliases for libev --- */
 typedef struct ev_loop  evloop_t;
@@ -62,4 +62,4 @@ typedef struct ev_timer evtimer_t;
 typedef void (*evio_cb_t)(evloop_t *evloop, struct ev_watcher *watcher, int revents);
 typedef void (*evtimer_cb_t)(evloop_t *evloop, struct ev_watcher *watcher, int revents);
 
-#endif
+#endif /* TPROXY2TUNNEL_EV_TYPES_H */

@@ -139,7 +139,7 @@ static bool tcp_setup_prepare_header(int client_sockfd, bool isipv4,
     char ipstr[IP6STRLEN];
     portno_t portno;
 
-    if (!get_tcp_orig_dstaddr(isipv4 ? AF_INET : AF_INET6, client_sockfd, &skaddr, !(g_options & OPT_TCP_USE_REDIRECT))) {
+    if (!get_tcp_orig_dstaddr(isipv4 ? AF_INET : AF_INET6, client_sockfd, &skaddr)) {
         return false;
     }
     IF_VERBOSE {

@@ -1,6 +1,8 @@
 #ifndef TPROXY2TUNNEL_ADDR_HEADER_H
 #define TPROXY2TUNNEL_ADDR_HEADER_H
 
+#include "netutils.h"
+
 /*
  * Tunnel address header encoding.
  *
@@ -13,15 +15,11 @@
  *   0x03  Domain: ATYP(1) + LEN(1) + DOMAIN(N) + PORT(2) = 4+N bytes
  */
 
-#include "netutils.h"
-
-/* Address type constants (same values as SOCKS5) */
 #define ADDRTYPE_IPV4   0x01
 #define ADDRTYPE_DOMAIN 0x03
 #define ADDRTYPE_IPV6   0x04
 
 /* Packed header structs for TCP (prefix-style, written forward) */
-
 typedef struct {
     uint8_t   addrtype;
     ipaddr4_t ipaddr4;
@@ -82,4 +80,4 @@ char *addr_header_build_udp(char *payload_start, const char *domain,
                             const skaddr6_t *skaddr, bool isipv4,
                             size_t *out_headerlen);
 
-#endif
+#endif /* TPROXY2TUNNEL_ADDR_HEADER_H */

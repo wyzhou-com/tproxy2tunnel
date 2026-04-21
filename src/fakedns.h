@@ -1,5 +1,5 @@
-#ifndef IPT2SOCKS_FAKEDNS_H
-#define IPT2SOCKS_FAKEDNS_H
+#ifndef TPROXY2TUNNEL_FAKEDNS_H
+#define TPROXY2TUNNEL_FAKEDNS_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -24,4 +24,4 @@ const char *fakedns_try_resolve(uint32_t ip_net, bool *is_miss);
 void fakedns_save(const char *path);
 void fakedns_load(const char *path);
 
-#endif
+#endif /* TPROXY2TUNNEL_FAKEDNS_H */

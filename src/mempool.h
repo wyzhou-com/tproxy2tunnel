@@ -1,5 +1,5 @@
-#ifndef IPT2SOCKS_MEMPOOL_H
-#define IPT2SOCKS_MEMPOOL_H
+#ifndef TPROXY2TUNNEL_MEMPOOL_H
+#define TPROXY2TUNNEL_MEMPOOL_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -12,4 +12,4 @@ void* mempool_calloc_sized(memory_pool_t *pool, size_t size);
 void mempool_free_sized(memory_pool_t *pool, void *ptr, size_t size);
 size_t mempool_destroy(memory_pool_t *pool);
 
-#endif /* IPT2SOCKS_MEMPOOL_H */
+#endif /* TPROXY2TUNNEL_MEMPOOL_H */

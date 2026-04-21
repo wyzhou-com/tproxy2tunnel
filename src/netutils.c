@@ -3,19 +3,12 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <grp.h>
 #include <netinet/tcp.h>
-#include <pwd.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 #include "logutils.h"
-
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
 
 #ifndef SO_REUSEPORT
 #define SO_REUSEPORT 15
@@ -45,14 +38,6 @@
 #define IPV6_RECVORIGDSTADDR 74
 #endif
 
-#ifndef SO_ORIGINAL_DST
-#define SO_ORIGINAL_DST 80
-#endif
-
-#ifndef IP6T_SO_ORIGINAL_DST
-#define IP6T_SO_ORIGINAL_DST 80
-#endif
-
 void set_nofile_limit(size_t nofile) {
     if (setrlimit(RLIMIT_NOFILE, &(struct rlimit) {
     nofile, nofile
@@ -68,50 +53,6 @@ size_t get_nofile_limit(void) {
         v.rlim_cur = 0;
     }
     return v.rlim_cur;
-}
-
-bool run_as_user(const char *username, char *argv[]) {
-    if (geteuid() != 0) {
-        LOGINF("[run_as_user] not running as root, ignore --run-user='%s'", username);
-        return true; /* ignore if current user is not root */
-    }
-
-    const struct passwd *userinfo = getpwnam(username);
-    if (!userinfo) {
-        LOGERR("[run_as_user] user:'%s' does not exist in this system", username);
-        return false;
-    }
-
-    if (userinfo->pw_uid == 0) {
-        return true; /* ignore if target user is root */
-    }
-
-    if (setgid(userinfo->pw_gid) < 0) {
-        LOGERR("[run_as_user] change to gid:%u of user:'%s': %s", userinfo->pw_gid, userinfo->pw_name, strerror(errno));
-        return false;
-    }
-
-    if (initgroups(userinfo->pw_name, userinfo->pw_gid) < 0) {
-        LOGERR("[run_as_user] initgroups(%u) of user:'%s': %s", userinfo->pw_gid, userinfo->pw_name, strerror(errno));
-        return false;
-    }
-
-    if (setuid(userinfo->pw_uid) < 0) {
-        LOGERR("[run_as_user] change to uid:%u of user:'%s': %s", userinfo->pw_uid, userinfo->pw_name, strerror(errno));
-        return false;
-    }
-
-    static char execfile_abspath[PATH_MAX] = {0};
-    if (readlink("/proc/self/exe", execfile_abspath, PATH_MAX - 1) < 0) {
-        LOGERR("[run_as_user] readlink('/proc/self/exe'): %s", strerror(errno));
-        return false;
-    }
-
-    if (execv(execfile_abspath, argv) < 0) {
-        LOGERR("[run_as_user] execv('%s', args): %s", execfile_abspath, strerror(errno));
-        return false;
-    }
-    return true; /* unreachable on success (execv replaces the image) */
 }
 
 int get_ipstr_family(const char *ipstr) {
@@ -336,12 +277,12 @@ static inline int new_nonblock_sockfd(int family, int sktype) {
     return sockfd;
 }
 
-int new_tcp_listen_sockfd(int family, bool is_tproxy, bool is_reuse_port, bool is_tfo_accept) {
+int new_tcp_listen_sockfd(int family, bool is_reuse_port, bool is_tfo_accept) {
     int sockfd = new_nonblock_sockfd(family, SOCK_STREAM);
     if (sockfd < 0) {
         return sockfd;
     }
-    if (is_tproxy && !set_ip_transparent(family, sockfd)) {
+    if (!set_ip_transparent(family, sockfd)) {
         return close_and_fail(sockfd);
     }
     if (is_reuse_port) {
@@ -399,25 +340,11 @@ int new_udp_normal_sockfd(int family) {
     return new_nonblock_sockfd(family, SOCK_DGRAM);
 }
 
-bool get_tcp_orig_dstaddr(int family, int sockfd, void *dstaddr, bool is_tproxy) {
+bool get_tcp_orig_dstaddr(int family, int sockfd, void *dstaddr) {
     socklen_t addrlen = (family == AF_INET) ? sizeof(skaddr4_t) : sizeof(skaddr6_t);
-    if (is_tproxy) {
-        if (getsockname(sockfd, dstaddr, &addrlen) < 0) {
-            LOGERR("[get_tcp_orig_dstaddr] addr_family:%s, getsockname(%d): %s", (family == AF_INET) ? "inet" : "inet6", sockfd, strerror(errno));
-            return false;
-        }
-    } else {
-        if (family == AF_INET) {
-            if (getsockopt(sockfd, IPPROTO_IP, SO_ORIGINAL_DST, dstaddr, &addrlen) < 0) {
-                LOGERR("[get_tcp_orig_dstaddr] getsockopt(%d, SO_ORIGINAL_DST): %s", sockfd, strerror(errno));
-                return false;
-            }
-        } else {
-            if (getsockopt(sockfd, IPPROTO_IPV6, IP6T_SO_ORIGINAL_DST, dstaddr, &addrlen) < 0) {
-                LOGERR("[get_tcp_orig_dstaddr] getsockopt(%d, IP6T_SO_ORIGINAL_DST): %s", sockfd, strerror(errno));
-                return false;
-            }
-        }
+    if (getsockname(sockfd, dstaddr, &addrlen) < 0) {
+        LOGERR("[get_tcp_orig_dstaddr] addr_family:%s, getsockname(%d): %s", (family == AF_INET) ? "inet" : "inet6", sockfd, strerror(errno));
+        return false;
     }
     return true;
 }

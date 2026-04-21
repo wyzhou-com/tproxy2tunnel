@@ -45,4 +45,4 @@ typedef struct tcp_session_t {
 void tcp_proxy_on_accept(evloop_t *evloop, struct ev_watcher *watcher, int revents);
 void tcp_proxy_close_all_sessions(evloop_t *evloop);
 
-#endif
+#endif /* TPROXY2TUNNEL_TCP_PROXY_H */

@@ -1,5 +1,5 @@
-#ifndef IPT2SOCKS_NETUTILS_H
-#define IPT2SOCKS_NETUTILS_H
+#ifndef TPROXY2TUNNEL_NETUTILS_H
+#define TPROXY2TUNNEL_NETUTILS_H
 
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -15,9 +15,7 @@
 #define PORTSTRLEN 6
 
 #define IP4STR_LOOPBACK "127.0.0.1"
-#define IP4STR_WILDCARD "0.0.0.0"
 #define IP6STR_LOOPBACK "::1"
-#define IP6STR_WILDCARD "::"
 
 #define UDP_CTRLMESG_BUFSIZ 64
 #define UDP_DATAGRAM_MAXSIZ 65507 /* 65535 - iphdr(20) - udphdr(8) */
@@ -45,22 +43,20 @@ typedef struct sockaddr_in6 skaddr6_t;
 void set_nofile_limit(size_t nofile);
 size_t get_nofile_limit(void);
 
-bool run_as_user(const char *username, char *argv[]);
-
 int get_ipstr_family(const char *ipstr);
 void build_socket_addr(int family, void *skaddr, const char *ipstr, portno_t portno);
 void parse_socket_addr(const void *skaddr, char *ipstr, portno_t *portno);
 
 int new_nonblock_pipefd(int pipefd[2]); /* return 0:success, -1:error */
 
-int new_tcp_listen_sockfd(int family, bool is_tproxy, bool is_reuse_port, bool is_tfo_accept);
+int new_tcp_listen_sockfd(int family, bool is_reuse_port, bool is_tfo_accept);
 int new_tcp_connect_sockfd(int family, uint8_t tcp_syncnt);
 
 int new_udp_tprecv_sockfd(int family, bool is_reuse_port);
 int new_udp_tpsend_sockfd(int family);
 int new_udp_normal_sockfd(int family);
 
-bool get_tcp_orig_dstaddr(int family, int sockfd, void *dstaddr, bool is_tproxy);
+bool get_tcp_orig_dstaddr(int family, int sockfd, void *dstaddr);
 bool get_udp_orig_dstaddr(int family, struct msghdr *msg, void *dstaddr);
 
 /* same as `accept()`, just a simple wrapper */
@@ -75,4 +71,4 @@ bool tcp_has_error(int sockfd);
 /* set so_linger(delay=0) and call close(sockfd) */
 void tcp_close_by_rst(int sockfd);
 
-#endif
+#endif /* TPROXY2TUNNEL_NETUTILS_H */

@@ -14,8 +14,6 @@ char      g_bind_ipstr6[IP6STRLEN] = IP6STR_LOOPBACK;
 portno_t  g_bind_portno            = 60080;
 skaddr4_t g_bind_skaddr4           = {0};
 skaddr6_t g_bind_skaddr6           = {0};
-skaddr4_t g_tcp_bind_skaddr4       = {0};
-skaddr6_t g_tcp_bind_skaddr6       = {0};
 
 char      g_server_ipstr[IP6STRLEN] = "127.0.0.1";
 portno_t  g_server_portno           = 1080;

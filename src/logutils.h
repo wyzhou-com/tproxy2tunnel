@@ -1,5 +1,5 @@
-#ifndef IPT2SOCKS_LOGUTILS_H
-#define IPT2SOCKS_LOGUTILS_H
+#ifndef TPROXY2TUNNEL_LOGUTILS_H
+#define TPROXY2TUNNEL_LOGUTILS_H
 
 #include <stdbool.h>
 
@@ -8,7 +8,7 @@ extern bool g_verbose;
 
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
-#endif
+#endif /* unlikely */
 
 typedef enum {
     LOG_LEVEL_INF,
@@ -35,4 +35,4 @@ void log_print(log_level_t level, const char *fmt, ...) __attribute__((format(pr
 #define LOGWAR(fmt, ...) log_print(LOG_LEVEL_WAR, fmt, ##__VA_ARGS__)
 #define LOG_ALWAYS_INF(fmt, ...) log_print(LOG_LEVEL_ALWAYS_INF, fmt, ##__VA_ARGS__)
 
-#endif
+#endif /* TPROXY2TUNNEL_LOGUTILS_H */
