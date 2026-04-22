@@ -1,15 +1,15 @@
 # tproxy2tunnel
 
-A lightweight C relay that converts Linux tproxy/redirect-captured traffic into the shadowsocks tunnel wire format (ATYP+ADDR+PORT prefix), eliminating the 2+ RTT SOCKS5 handshake between the transparent proxy adapter and ss-local.
+A lightweight C relay that converts Linux tproxy-captured traffic into the shadowsocks tunnel wire format (ATYP+ADDR+PORT prefix), eliminating the 2+ RTT SOCKS5 handshake between the transparent proxy adapter and ss-local.
 
-In essence, this is the client half of a local unencrypted shadowsocks relay. It prepends each connection/packet with the target address in SOCKS5 address encoding, then forwards to ss-local running in dynamic tunnel mode. ss-local reads the address, wraps the payload with encryption, and sends it to the remote ss-server. No encryption is needed on the local segment because both processes run on the same machine.
+In essence, this is the client half of a local unencrypted shadowsocks relay. It prepends each connection/packet with the target address in SOCKS5 address encoding, then forwards to ss-local running in dynamic tunnel mode. ss-local reads the address, wraps the payload with encryption, and sends it to the remote ss-server. No encryption is needed when both processes run locally.
 
 ## Architecture
 
 **TCP:**
 
 ```
-kernel tproxy/redirect → accept → get orig dst →
+kernel tproxy → accept → get orig dst →
 [fakedns reverse lookup] → connect to ss-local →
 send ATYP+ADDR+PORT (with optional TFO) → splice-based
 bidirectional forwarding
@@ -38,7 +38,7 @@ receive response → strip header → tproxy sendto client
 
 - **FakeDNS integration:** built-in fake DNS server assigns IPs from a configurable range, with reverse lookup to recover domain names for the tunnel header. Supports persistence via cache file.
 
-- **Memory pools:** fixed-size slab allocators for `tcp_tunnel_ctx_t`, `udp_tunnelctx_t`, and `udp_tproxyctx_t`, bounded by configurable capacity limits.
+- **Memory pools:** fixed-size slab allocators for `tcp_session_t`, `udp_session_t`, UDP main/fork cache nodes, and `udp_tproxy_entry_t`, bounded by configurable capacity limits.
 
 ## Build
 
@@ -65,13 +65,10 @@ tproxy2tunnel <options...>
  -j, --thread-nums <num>            number of the worker threads, default: 1
  -J, --udp-thread-nums <num>        number of udp threads, default: 1
  -n, --nofile-limit <num>           set nofile limit, may need root privilege
- -u, --run-user <user>              run as the given user, need root privilege
  -T, --tcp-only                     listen tcp only, aka: disable udp proxy
  -U, --udp-only                     listen udp only, aka: disable tcp proxy
  -4, --ipv4-only                    listen ipv4 only, aka: disable ipv6 proxy
  -6, --ipv6-only                    listen ipv6 only, aka: disable ipv4 proxy
- -R, --redirect                     use redirect instead of tproxy for tcp
- -r, --reuse-port                   enable so_reuseport for single thread
  -w, --tfo-accept                   enable tcp_fastopen for server socket
  -W, --tfo-connect                  enable tcp_fastopen for client socket
  -v, --verbose                      print verbose log, affect performance
