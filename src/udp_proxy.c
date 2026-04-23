@@ -29,8 +29,6 @@ _Static_assert(sizeof(udp_fork_key_t) == 2 * sizeof(udp_endpoint_key_t),
 _Static_assert(offsetof(udp_session_t, udp_watcher) == 0,
                "udp_watcher must be first in udp_session_t");
 
-static void udp_tunnel_on_reply(evloop_t *evloop, struct ev_watcher *watcher, int revents);
-
 typedef enum {
     UDP_ENTRY_INDEXED,
     UDP_ENTRY_DETACHED,
@@ -67,35 +65,6 @@ static __thread struct mmsghdr  g_tunnel_msgs[UDP_BATCH_SIZE];
 static __thread struct mmsghdr  g_tunnel_send_msgs[UDP_BATCH_SIZE];
 static __thread struct iovec    g_tunnel_iovs[UDP_BATCH_SIZE];
 
-static inline void udp_endpoint_to_string(const udp_endpoint_key_t *ep, char ipstr[IP6STRLEN], portno_t *portno) {
-    if (ep->family == AF_INET) {
-        inet_ntop(AF_INET, ep->addr, ipstr, IP6STRLEN);
-    } else {
-        inet_ntop(AF_INET6, ep->addr, ipstr, IP6STRLEN);
-    }
-    *portno = ntohs(ep->port);
-}
-
-static inline void udp_log_transfer(const char *stage, const char *action,
-                                    const udp_endpoint_key_t *src, const udp_endpoint_key_t *dst,
-                                    const char *unit, int val) {
-    IF_VERBOSE {
-        char src_ipstr[IP6STRLEN];
-        char dst_ipstr[IP6STRLEN];
-        portno_t src_port;
-        portno_t dst_port;
-
-        udp_endpoint_to_string(src, src_ipstr, &src_port);
-        udp_endpoint_to_string(dst, dst_ipstr, &dst_port);
-
-        LOGINF_RAW("[%s] %s: %s#%hu -> %s#%hu, %s:%d",
-                   stage, action,
-                   src_ipstr, src_port,
-                   dst_ipstr, dst_port,
-                   unit, val);
-    }
-}
-
 static inline udp_endpoint_key_t udp_endpoint_from_skaddr(const skaddr6_t *skaddr, bool is_ipv4) {
     udp_endpoint_key_t ep;
     memset(&ep, 0, sizeof(ep));
@@ -126,11 +95,32 @@ static inline void udp_skaddr_from_endpoint(skaddr6_t *dst, const udp_endpoint_k
     }
 }
 
-static inline void udp_session_touch(udp_session_t *session, ev_tstamp now) {
-    if (session->main_idx) {
-        session->main_idx->last_active = now;
+static inline void udp_endpoint_to_string(const udp_endpoint_key_t *ep, char ipstr[IP6STRLEN], portno_t *portno) {
+    if (ep->family == AF_INET) {
+        inet_ntop(AF_INET, ep->addr, ipstr, IP6STRLEN);
     } else {
-        session->fork_idx->last_active = now;
+        inet_ntop(AF_INET6, ep->addr, ipstr, IP6STRLEN);
+    }
+    *portno = ntohs(ep->port);
+}
+
+static inline void udp_log_transfer(const char *stage, const char *action,
+                                    const udp_endpoint_key_t *src, const udp_endpoint_key_t *dst,
+                                    const char *unit, int val) {
+    IF_VERBOSE {
+        char src_ipstr[IP6STRLEN];
+        char dst_ipstr[IP6STRLEN];
+        portno_t src_port;
+        portno_t dst_port;
+
+        udp_endpoint_to_string(src, src_ipstr, &src_port);
+        udp_endpoint_to_string(dst, dst_ipstr, &dst_port);
+
+        LOGINF_RAW("[%s] %s: %s#%hu -> %s#%hu, %s:%d",
+                   stage, action,
+                   src_ipstr, src_port,
+                   dst_ipstr, dst_port,
+                   unit, val);
     }
 }
 
@@ -237,13 +227,6 @@ static bool udp_ingress_prepare(struct msghdr *msg, size_t nrecv, char *buffer, 
     return true;
 }
 
-static udp_fork_key_t udp_ingress_build_fork_key(const udp_ingress_t *pkt) {
-    udp_fork_key_t fork_key;
-    fork_key.client = pkt->client;
-    fork_key.target = pkt->orig_dst;
-    return fork_key;
-}
-
 static udp_session_t *udp_session_find(const udp_ingress_t *pkt, const udp_fork_key_t *fork_key) {
     if (pkt->fake_domain) {
         assert(fork_key);
@@ -264,21 +247,12 @@ static udp_session_t *udp_session_find(const udp_ingress_t *pkt, const udp_fork_
     return NULL;
 }
 
-static int udp_tunnel_connect(void) {
-    int udp_sockfd = new_udp_normal_sockfd(g_server_skaddr.sin6_family);
-    if (udp_sockfd < 0) {
-        LOGERR("[udp_tunnel] new_udp_normal_sockfd: %s", strerror(errno));
-        return -1;
+static inline void udp_session_touch(udp_session_t *session, ev_tstamp now) {
+    if (session->main_idx) {
+        session->main_idx->last_active = now;
+    } else {
+        session->fork_idx->last_active = now;
     }
-
-    bool server_is_ipv4 = g_server_skaddr.sin6_family == AF_INET;
-    if (connect(udp_sockfd, (void *)&g_server_skaddr, server_is_ipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t)) < 0) {
-        LOGERR("[udp_tunnel] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
-        close(udp_sockfd);
-        return -1;
-    }
-
-    return udp_sockfd;
 }
 
 static void udp_session_destroy(evloop_t *evloop, udp_session_t *session) {
@@ -369,112 +343,21 @@ static bool udp_session_register_fork(evloop_t *evloop, udp_session_t *session, 
     return true;
 }
 
-static udp_session_t *udp_session_create(evloop_t *evloop, const udp_ingress_t *pkt, const udp_fork_key_t *fork_key) {
-    int udp_sockfd = udp_tunnel_connect();
+static int udp_tunnel_connect(void) {
+    int udp_sockfd = new_udp_normal_sockfd(g_server_skaddr.sin6_family);
     if (udp_sockfd < 0) {
-        return NULL;
+        LOGERR("[udp_tunnel] new_udp_normal_sockfd: %s", strerror(errno));
+        return -1;
     }
 
-    udp_session_t *session = mempool_alloc_sized(g_udp_session_pool, sizeof(*session));
-    if (!session) {
-        LOGERR("[udp_session] mempool alloc failed for session");
+    bool server_is_ipv4 = g_server_skaddr.sin6_family == AF_INET;
+    if (connect(udp_sockfd, (void *)&g_server_skaddr, server_is_ipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t)) < 0) {
+        LOGERR("[udp_tunnel] connect to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
         close(udp_sockfd);
-        return NULL;
+        return -1;
     }
 
-    session->client      = pkt->client;
-    session->orig_dst    = pkt->orig_dst;
-    session->is_fakedns  = (pkt->fake_domain != NULL);
-    session->main_idx    = NULL;
-    session->fork_idx    = NULL;
-    ev_tstamp now        = ev_now(evloop);
-
-    ev_io_init(&session->udp_watcher, udp_tunnel_on_reply, udp_sockfd, EV_READ);
-    ev_io_start(evloop, &session->udp_watcher);
-
-    bool indexed = session->is_fakedns
-                   ? udp_session_register_fork(evloop, session, fork_key, now)
-                   : udp_session_register_main(evloop, session, now);
-    if (!indexed) {
-        udp_session_destroy(evloop, session);
-        return NULL;
-    }
-
-    assert((session->main_idx != NULL) ^ (session->fork_idx != NULL));
-    udp_log_session_route("new", pkt);
-    return session;
-}
-
-static void udp_session_send_to_tunnel(evloop_t *evloop, udp_session_t *session,
-                                       const udp_endpoint_key_t *orig_dst_for_log,
-                                       const char *data, size_t data_len) {
-    ssize_t nsend = send(session->udp_watcher.fd, data, data_len, 0);
-    if (nsend < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            LOGERR("[udp_tunnel] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
-            if (errno == EPIPE || errno == ECONNRESET || errno == ECONNREFUSED) {
-                udp_session_release_indexed(evloop, session);
-            }
-        }
-        return;
-    }
-
-    udp_log_transfer("udp_tunnel", "send",
-                     &session->client, orig_dst_for_log,
-                     "nsend", (int)nsend);
-}
-
-static void udp_ingress_handle(evloop_t *evloop, evio_t *tprecv_watcher, struct msghdr *msg, size_t nrecv, char *buffer) {
-    bool is_ipv4 = (intptr_t)tprecv_watcher->data;
-    udp_ingress_t pkt;
-    udp_fork_key_t fork_key;
-    const udp_fork_key_t *fork_key_ptr = NULL;
-
-    if (!udp_ingress_prepare(msg, nrecv, buffer, is_ipv4, &pkt)) {
-        return;
-    }
-
-    if (pkt.fake_domain) {
-        fork_key = udp_ingress_build_fork_key(&pkt);
-        fork_key_ptr = &fork_key;
-    }
-
-    udp_session_t *session = udp_session_find(&pkt, fork_key_ptr);
-    if (!session) {
-        session = udp_session_create(evloop, &pkt, fork_key_ptr);
-        if (!session) {
-            return;
-        }
-    } else {
-        udp_session_touch(session, ev_now(evloop));
-    }
-
-    udp_session_send_to_tunnel(evloop, session, &pkt.orig_dst, pkt.header_start, pkt.header_len + nrecv);
-}
-
-void udp_proxy_on_recvmsg(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
-    evio_t *tprecv_watcher = (evio_t *)watcher;
-    bool is_ipv4 = (intptr_t)tprecv_watcher->data;
-
-    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
-        g_tprecv_msgs[i].msg_hdr.msg_namelen    = sizeof(skaddr6_t);
-        g_tprecv_msgs[i].msg_hdr.msg_controllen = UDP_CTRLMESG_BUFSIZ;
-    }
-
-    int retval = recvmmsg(tprecv_watcher->fd, g_tprecv_msgs, UDP_BATCH_SIZE, 0, NULL);
-
-    if (retval < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            LOGERR("[udp_proxy] recvmmsg from udp%s socket: %s", is_ipv4 ? "4" : "6", strerror(errno));
-        }
-        return;
-    }
-
-    if (retval == 0) return;
-
-    for (int i = 0; i < retval; i++) {
-        udp_ingress_handle(evloop, tprecv_watcher, &g_tprecv_msgs[i].msg_hdr, (size_t)g_tprecv_msgs[i].msg_len, g_udp_batch_buffer[i]);
-    }
+    return udp_sockfd;
 }
 
 static bool udp_tunnel_parse_reply(const udp_session_t *session, char *buffer, size_t nrecv, udp_reply_t *reply) {
@@ -691,6 +574,116 @@ static void udp_tunnel_on_reply(evloop_t *evloop, struct ev_watcher *watcher, in
     }
 }
 
+static udp_session_t *udp_session_create(evloop_t *evloop, const udp_ingress_t *pkt, const udp_fork_key_t *fork_key) {
+    int udp_sockfd = udp_tunnel_connect();
+    if (udp_sockfd < 0) {
+        return NULL;
+    }
+
+    udp_session_t *session = mempool_alloc_sized(g_udp_session_pool, sizeof(*session));
+    if (!session) {
+        LOGERR("[udp_session] mempool alloc failed for session");
+        close(udp_sockfd);
+        return NULL;
+    }
+
+    session->client      = pkt->client;
+    session->orig_dst    = pkt->orig_dst;
+    session->is_fakedns  = (pkt->fake_domain != NULL);
+    session->main_idx    = NULL;
+    session->fork_idx    = NULL;
+    ev_tstamp now        = ev_now(evloop);
+
+    ev_io_init(&session->udp_watcher, udp_tunnel_on_reply, udp_sockfd, EV_READ);
+    ev_io_start(evloop, &session->udp_watcher);
+
+    bool indexed = session->is_fakedns
+                   ? udp_session_register_fork(evloop, session, fork_key, now)
+                   : udp_session_register_main(evloop, session, now);
+    if (!indexed) {
+        udp_session_destroy(evloop, session);
+        return NULL;
+    }
+
+    assert((session->main_idx != NULL) ^ (session->fork_idx != NULL));
+    udp_log_session_route("new", pkt);
+    return session;
+}
+
+static void udp_session_send_to_tunnel(evloop_t *evloop, udp_session_t *session,
+                                       const udp_endpoint_key_t *orig_dst_for_log,
+                                       const char *data, size_t data_len) {
+    ssize_t nsend = send(session->udp_watcher.fd, data, data_len, 0);
+    if (nsend < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOGERR("[udp_tunnel] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
+            if (errno == EPIPE || errno == ECONNRESET || errno == ECONNREFUSED) {
+                udp_session_release_indexed(evloop, session);
+            }
+        }
+        return;
+    }
+
+    udp_log_transfer("udp_tunnel", "send",
+                     &session->client, orig_dst_for_log,
+                     "nsend", (int)nsend);
+}
+
+static void udp_ingress_handle(evloop_t *evloop, evio_t *tprecv_watcher, struct msghdr *msg, size_t nrecv, char *buffer) {
+    bool is_ipv4 = (intptr_t)tprecv_watcher->data;
+    udp_ingress_t pkt;
+    udp_fork_key_t fork_key;
+    const udp_fork_key_t *fork_key_ptr = NULL;
+
+    if (!udp_ingress_prepare(msg, nrecv, buffer, is_ipv4, &pkt)) {
+        return;
+    }
+
+    if (pkt.fake_domain) {
+        fork_key = (udp_fork_key_t) {
+            .client = pkt.client,
+            .target = pkt.orig_dst,
+        };
+        fork_key_ptr = &fork_key;
+    }
+
+    udp_session_t *session = udp_session_find(&pkt, fork_key_ptr);
+    if (!session) {
+        session = udp_session_create(evloop, &pkt, fork_key_ptr);
+        if (!session) {
+            return;
+        }
+    } else {
+        udp_session_touch(session, ev_now(evloop));
+    }
+
+    udp_session_send_to_tunnel(evloop, session, &pkt.orig_dst, pkt.header_start, pkt.header_len + nrecv);
+}
+
+void udp_proxy_on_recvmsg(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
+    evio_t *tprecv_watcher = (evio_t *)watcher;
+    bool is_ipv4 = (intptr_t)tprecv_watcher->data;
+
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
+        g_tprecv_msgs[i].msg_hdr.msg_namelen    = sizeof(skaddr6_t);
+        g_tprecv_msgs[i].msg_hdr.msg_controllen = UDP_CTRLMESG_BUFSIZ;
+    }
+
+    int retval = recvmmsg(tprecv_watcher->fd, g_tprecv_msgs, UDP_BATCH_SIZE, 0, NULL);
+
+    if (retval < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            LOGERR("[udp_proxy] recvmmsg from udp%s socket: %s", is_ipv4 ? "4" : "6", strerror(errno));
+        }
+        return;
+    }
+
+    if (retval == 0) return;
+
+    for (int i = 0; i < retval; i++) {
+        udp_ingress_handle(evloop, tprecv_watcher, &g_tprecv_msgs[i].msg_hdr, (size_t)g_tprecv_msgs[i].msg_len, g_udp_batch_buffer[i]);
+    }
+}
 
 #define GC_INTERVAL_SEC      10.0
 
