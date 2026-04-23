@@ -610,16 +610,13 @@ static udp_session_t *udp_session_create(evloop_t *evloop, const udp_ingress_t *
     return session;
 }
 
-static void udp_session_send_to_tunnel(evloop_t *evloop, udp_session_t *session,
+static void udp_session_send_to_tunnel(evloop_t *evloop __attribute__((unused)), udp_session_t *session,
                                        const udp_endpoint_key_t *orig_dst_for_log,
                                        const char *data, size_t data_len) {
     ssize_t nsend = send(session->udp_watcher.fd, data, data_len, 0);
     if (nsend < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             LOGERR("[udp_tunnel] send to %s#%hu: %s", g_server_ipstr, g_server_portno, strerror(errno));
-            if (errno == EPIPE || errno == ECONNRESET || errno == ECONNREFUSED) {
-                udp_session_release_indexed(evloop, session);
-            }
         }
         return;
     }
