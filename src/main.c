@@ -333,8 +333,13 @@ int main(int argc, char* argv[]) {
         LOG_ALWAYS_INF("[main] max number of syn retries: %hhu", g_tcp_syncnt_max);
     }
     if (g_options & OPT_ENABLE_UDP) {
-        LOG_ALWAYS_INF("[main] udp cache capacity: main=%hu fork=%hu tproxy=%hu",
-                       udp_lrucache_get_main_maxsize(), udp_lrucache_get_fork_maxsize(), udp_lrucache_get_tproxy_maxsize());
+        if (g_options & OPT_ENABLE_FAKEDNS) {
+            LOG_ALWAYS_INF("[main] udp cache capacity: main=%hu fork=%hu tproxy=%hu",
+                           udp_lrucache_get_main_maxsize(), udp_lrucache_get_fork_maxsize(), udp_lrucache_get_tproxy_maxsize());
+        } else {
+            LOG_ALWAYS_INF("[main] udp cache capacity: main=%hu tproxy=%hu",
+                           udp_lrucache_get_main_maxsize(), udp_lrucache_get_tproxy_maxsize());
+        }
         LOG_ALWAYS_INF("[main] udp session idle timeout: %hu", g_udp_idletimeout_sec);
     }
     LOG_ALWAYS_INF("[main] number of worker threads: %hhu", g_nthreads);
@@ -555,13 +560,14 @@ static void* run_event_loop(void *arg) {
     int     fakedns_sockfd = -1;
 
     /* Initialize memory pools (thread-local) */
+    bool fakedns_enabled = (g_options & OPT_ENABLE_FAKEDNS) != 0;
     size_t main_max_blocks = udp_lrucache_get_main_maxsize();
-    size_t fork_max_blocks = udp_lrucache_get_fork_maxsize();
+    size_t fork_max_blocks = fakedns_enabled ? udp_lrucache_get_fork_maxsize() : 0;
     /* LRU add inserts first, then evicts. Pools need one spare block so a full
      * cache can allocate the incoming entry before freeing the victim. */
     size_t session_max_blocks = main_max_blocks + fork_max_blocks + 1;
     size_t main_node_max_blocks = main_max_blocks + 1;
-    size_t fork_node_max_blocks = fork_max_blocks + 1;
+    size_t fork_node_max_blocks = fakedns_enabled ? fork_max_blocks + 1 : 0;
 
     size_t session_initial_blocks = MEMPOOL_INITIAL_SIZE;
     if (session_initial_blocks > session_max_blocks) {
@@ -571,7 +577,7 @@ static void* run_event_loop(void *arg) {
     if (main_node_initial_blocks > main_node_max_blocks) {
         main_node_initial_blocks = main_node_max_blocks;
     }
-    size_t fork_node_initial_blocks = MEMPOOL_INITIAL_SIZE;
+    size_t fork_node_initial_blocks = fakedns_enabled ? MEMPOOL_INITIAL_SIZE : 0;
     if (fork_node_initial_blocks > fork_node_max_blocks) {
         fork_node_initial_blocks = fork_node_max_blocks;
     }
@@ -617,15 +623,17 @@ static void* run_event_loop(void *arg) {
             goto cleanup;
         }
 
-        g_udp_fork_node_pool = mempool_create(
-                                   sizeof(udp_fork_node_t),
-                                   fork_node_initial_blocks,
-                                   fork_node_max_blocks
-                               );
-        if (!g_udp_fork_node_pool) {
-            LOGERR("[run_event_loop] failed to create udp fork-node memory pool");
-            exit_code = 1;
-            goto cleanup;
+        if (fakedns_enabled) {
+            g_udp_fork_node_pool = mempool_create(
+                                       sizeof(udp_fork_node_t),
+                                       fork_node_initial_blocks,
+                                       fork_node_max_blocks
+                                   );
+            if (!g_udp_fork_node_pool) {
+                LOGERR("[run_event_loop] failed to create udp fork-node memory pool");
+                exit_code = 1;
+                goto cleanup;
+            }
         }
 
         g_udp_tproxy_pool = mempool_create(
