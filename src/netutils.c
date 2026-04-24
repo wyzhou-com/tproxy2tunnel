@@ -380,13 +380,43 @@ int tcp_accept(int sockfd, void *addr, socklen_t *addrlen) {
     return newsockfd;
 }
 
-/* return: is_succ, tfo_succ if tfo_nsend >= 0 */
+static inline bool should_fallback_from_tfo(int err) {
+    switch (err) {
+        case EINVAL:
+        case ENOPROTOOPT:
+        case EOPNOTSUPP:
+        case EPROTONOSUPPORT:
+            return true;
+#ifdef ENOTSUP
+#if ENOTSUP != EOPNOTSUPP
+        case ENOTSUP:
+            return true;
+#endif
+#endif
+        default:
+            return false;
+    }
+}
+
+/* return: is_succ, tfo_succ if tfo_nsend >= 0; may fall back to plain connect */
 bool tcp_connect(int sockfd, const void *addr, const void *tfo_data, size_t tfo_datalen, ssize_t *tfo_nsend) {
     socklen_t addrlen = ((skaddr4_t *)addr)->sin_family == AF_INET ? sizeof(skaddr4_t) : sizeof(skaddr6_t);
     if (tfo_data && tfo_datalen && tfo_nsend) {
         *tfo_nsend = sendto(sockfd, tfo_data, tfo_datalen, MSG_FASTOPEN, addr, addrlen);
         if (*tfo_nsend < 0 && errno != EINPROGRESS) {
-            return false;
+            int saved_errno = errno;
+            if (!should_fallback_from_tfo(saved_errno)) {
+                return false;
+            }
+
+            IF_VERBOSE {
+                LOGINF_RAW("[tcp_connect] MSG_FASTOPEN unavailable: %s, falling back to connect()",
+                           strerror(saved_errno));
+            }
+            *tfo_nsend = -1;
+            if (connect(sockfd, addr, addrlen) < 0 && errno != EINPROGRESS) {
+                return false;
+            }
         }
     } else {
         if (connect(sockfd, addr, addrlen) < 0 && errno != EINPROGRESS) {

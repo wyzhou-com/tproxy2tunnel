@@ -62,7 +62,7 @@ bool get_udp_orig_dstaddr(int family, struct msghdr *msg, void *dstaddr);
 /* same as `accept()`, just a simple wrapper */
 int tcp_accept(int sockfd, void *addr, socklen_t *addrlen);
 
-/* return: is_succ, tfo_succ if tfo_nsend >= 0 */
+/* return: is_succ, tfo_succ if tfo_nsend >= 0; may fall back to plain connect */
 bool tcp_connect(int sockfd, const void *addr, const void *tfo_data, size_t tfo_datalen, ssize_t *tfo_nsend);
 
 /* on connect error, errno is set appropriately */
